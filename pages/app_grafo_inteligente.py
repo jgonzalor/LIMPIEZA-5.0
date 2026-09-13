@@ -1,4 +1,4 @@
-"""Sentinel 5.1.0: red de vínculos, organigrama y fichas con fotografía.
+"""Sentinel 5.2.0: editor visual de actores, vínculos y fichas con fotografía.
 
 La página es deliberadamente autocontenida para que la evolución del módulo no
 toque guardian, navegación, limpieza ni los demás módulos estables de Go Mapper.
@@ -16,7 +16,9 @@ import copy
 import hashlib
 import json
 import math
+from pathlib import Path
 import re
+import tempfile
 import unicodedata
 import uuid
 import zlib
@@ -33,7 +35,7 @@ from suite_nav import render_suite_sidebar
 from ui.components import render_info_panel, render_kpi_row, render_page_header, render_section
 
 
-APP_VERSION = "5.1.0-fichas-y-organigrama"
+APP_VERSION = "5.2.0-editor-visual"
 LOCAL_TZ = "America/Mazatlan"
 VALID_EVENT_TYPES = (
     "DATOS", "DATOS WIFI", "VOZ ENTRANTE", "VOZ SALIENTE", "VOZ TRANSITO",
@@ -82,7 +84,7 @@ ENTITY_COLUMNS = [
 RELATION_COLUMNS = [
     "relation_id", "source_id", "target_id", "relation_type", "start_date", "end_date",
     "source", "description", "confidence", "source_type", "source_detail", "created_by",
-    "created_at", "notes", "evidence_ids", "status", "support_count",
+    "created_at", "notes", "evidence_ids", "status", "support_count", "visual_color",
 ]
 EVENT_COLUMNS = [
     "event_id", "logical_event_id", "event_type", "event_type_raw", "classification_reason",
@@ -295,7 +297,7 @@ def new_state(case_name: str = "Caso sin nombre", case_id: str = "") -> dict:
         "case_id": case_id or short_id("CASO"), "case_name": case_name, "created_at": now_local(),
         "entities": [], "relationships": [], "events": [], "support": [], "evidences": [],
         "audit": [], "imports": [], "targets": [], "dedup_tolerance": 30,
-        "assets": {}, "entity_history": [],
+        "assets": {}, "entity_history": [], "canvas_revision": 0, "canvas_positions": {}, "canvas_sizes": {},
     }
 
 
@@ -619,6 +621,8 @@ def preserve_manual_context(previous: dict, rebuilt: dict) -> dict:
     rebuilt["relationships"].extend(manual_relations)
     rebuilt["assets"] = copy.deepcopy(previous.get("assets", {}))
     rebuilt["entity_history"] = copy.deepcopy(previous.get("entity_history", []))
+    rebuilt["canvas_positions"] = copy.deepcopy(previous.get("canvas_positions", {}))
+    rebuilt["canvas_sizes"] = copy.deepcopy(previous.get("canvas_sizes", {}))
     rebuilt["audit"] = copy.deepcopy(previous.get("audit", [])) + rebuilt["audit"]
     rebuilt["case_id"] = previous.get("case_id", rebuilt["case_id"])
     rebuilt["created_at"] = previous.get("created_at", rebuilt["created_at"])
@@ -682,6 +686,7 @@ def get_state() -> dict | None:
 def set_state(state: dict) -> None:
     previous = st.session_state.get("gm_identity_state", {})
     changed_case = previous.get("case_id") != state.get("case_id")
+    state["canvas_revision"] = max(int(state.get("canvas_revision", 0)), int(previous.get("canvas_revision", 0)) + 1)
     st.session_state["gm_identity_state"] = state
     if changed_case:
         for key in ("gm_graph_focus", "gm_graph_compare", "gm_graph_depth", "gm_graph_minimum", "gm_graph_sources", "gm_person_select"):
@@ -827,6 +832,211 @@ def relationship_graph(state: dict, focus: str = "", depth: int = 1, minimum: in
     return entities.copy(), relations.copy()
 
 
+def apply_canvas_action(state: dict, event: dict) -> tuple[dict, dict]:
+    """Apply one explicit browser action atomically; reject stale or replayed edits."""
+    if not isinstance(event, dict) or event.get("case_id") != state.get("case_id"):
+        raise ValueError("El diagrama pertenece a otro expediente. Recarga la vista.")
+    action_id = text_value(event.get("action_id"))
+    if not action_id or len(action_id) > 120:
+        raise ValueError("Acción sin identificador válido.")
+    if action_id in state.get("canvas_applied", []):
+        return state, {"id": action_id, "ok": True, "message": "Cambio ya guardado.", "duplicate": True}
+    if event.get("revision") != state.get("canvas_revision", 0):
+        raise ValueError("El expediente cambió. Revisa la vista actual y repite el cambio.")
+    mode = event.get("mode", "red")
+    if mode not in {"red", "organigrama"}:
+        raise ValueError("Distribución desconocida.")
+    operation = event.get("operation")
+    updated = copy.deepcopy(state)
+    lookup = entity_lookup(updated)
+    selected = ""
+    message = "Cambio guardado."
+    values = event.get("values") or {}
+    if not isinstance(values, dict):
+        raise ValueError("Valores de ficha inválidos.")
+    if operation in {"create", "edit"}:
+        selected = text_value(event.get("entity_id"))
+        current = lookup.get(selected, {})
+        if operation == "edit" and not current:
+            raise ValueError("Ese actor ya no está disponible.")
+        kind = current.get("entity_type") if current else text_value(values.get("entity_type"))
+        label = text_value(values.get("label"))
+        source = text_value(values.get("source"), "Captura manual")
+        confidence = text_value(values.get("confidence"), "PENDIENTE")
+        if kind not in ENTITY_TYPES or not label or len(label) > 500 or confidence not in CONFIDENCE_LEVELS:
+            raise ValueError("Revisa el tipo, el nombre y la confianza del actor.")
+        if mode == "organigrama" and kind != "PERSONA":
+            raise ValueError("Añade otros tipos de actor desde Red de vínculos.")
+        metadata = values.get("metadata") or {}
+        if not isinstance(metadata, dict) or any(key not in {x[0] for x in PROFILE_FIELDS} | {"visual_color", "visual_shape", "visual_group"} for key in metadata):
+            raise ValueError("Campos de ficha inválidos.")
+        metadata = {key: text_value(value)[:10000] for key, value in metadata.items()}
+        if metadata.get("visual_color") and not re.fullmatch(r"#[0-9A-Fa-f]{6}", metadata["visual_color"]):
+            raise ValueError("Color de actor inválido.")
+        if metadata.get("visual_shape") not in {None, "", "circle", "hexagon"}:
+            raise ValueError("Forma de actor inválida.")
+        evidence_ids = values.get("evidence_ids", [])
+        allowed_evidence = {row["evidence_id"] for row in updated.get("evidences", [])}
+        if not isinstance(evidence_ids, list) or not set(evidence_ids).issubset(allowed_evidence):
+            raise ValueError("La evidencia seleccionada no pertenece al expediente.")
+        portrait = None
+        if values.get("photo_data"):
+            encoded = text_value(values["photo_data"])
+            if len(encoded) > 7_000_000:
+                raise ValueError("La fotografía supera 5 MB.")
+            try:
+                raw = base64.b64decode(encoded.split(",", 1)[-1], validate=True)
+                upload = BytesIO(raw)
+                upload.name = text_value(values.get("photo_name"), "fotografia")
+                portrait = prepare_portrait(upload)
+            except (ValueError, OSError) as error:
+                raise ValueError("Fotografía inválida: " + str(error)) from error
+        if kind == "PERSONA":
+            selected = save_person_profile(updated, selected if current else "", label, metadata, confidence=confidence,
+                source=source, notes=text_value(values.get("notes")), evidence_ids=evidence_ids, portrait=portrait,
+                photo_source=text_value(values.get("photo_source"), source), remove_photo=bool(values.get("remove_photo")))
+        elif current:
+            # Phone/CDR identifiers remain immutable; edit annotations, not observed IDs.
+            if kind in {"TELEFONO", "IMEI", "IMSI/SIM", "CORREO ELECTRONICO", "ANTENA"} and label != current["label"]:
+                raise ValueError("El identificador técnico no se renombra. Crea otro actor si es distinto.")
+            before = copy.deepcopy(current)
+            current["label"] = label
+            current["normalized"] = normalize_identifier(label)
+            if current.get("source_type") == "MANUAL":
+                current["source_detail"] = source
+                current["confidence"] = confidence
+            merged = {**entity_metadata(current), **metadata}
+            if values.get("remove_photo"):
+                merged.pop("photo_asset", None)
+            current["metadata"] = json.dumps(merged, ensure_ascii=False)
+            current["notes"] = text_value(values.get("notes"))
+            current["evidence_ids"] = ",".join(sorted(set(filter(None, text_value(current.get("evidence_ids")).split(","))) | set(evidence_ids)))
+            updated.setdefault("entity_history", []).append({"revision_id": short_id("REV"), "entity_id": selected,
+                "timestamp": now_local(), "user": user_name(), "before": before, "after": copy.deepcopy(current)})
+            append_audit(updated, "ANOTAR_ACTOR", label, object_id=selected)
+        else:
+            selected = add_entity(updated, kind, label, source_type="MANUAL", source_detail=source, confidence=confidence,
+                notes=text_value(values.get("notes")), evidence_ids=evidence_ids, metadata=metadata)
+            append_audit(updated, "CREAR_ACTOR_VISUAL", f"{kind}: {label}", object_id=selected)
+        if kind != "PERSONA" and portrait:
+            row = entity_lookup(updated)[selected]
+            updated.setdefault("assets", {})[portrait["asset_id"]] = {**portrait, "source": text_value(values.get("photo_source"), source)}
+            row["metadata"] = json.dumps({**entity_metadata(row), "photo_asset": portrait["asset_id"]}, ensure_ascii=False)
+            eid = add_manual_evidence_to_state(updated, f"Imagen del actor · {label}", text_value(values.get("photo_source"), source), "Imagen original conservada en el expediente.", json.dumps({"asset_id": portrait["asset_id"], "sha256": portrait["sha256"]}))
+            row["evidence_ids"] = ",".join(sorted(set(filter(None, text_value(row.get("evidence_ids")).split(","))) | {eid}))
+            if operation == "edit" and updated.get("entity_history") and updated["entity_history"][-1].get("entity_id") == selected:
+                updated["entity_history"][-1]["after"] = copy.deepcopy(row)
+        message = "Actor creado. Puedes conectarlo con otro." if operation == "create" else "Ficha actualizada."
+    elif operation == "connect":
+        a, b = text_value(values.get("source_id")), text_value(values.get("target_id"))
+        kind = text_value(values.get("relation_type"))
+        confidence = text_value(values.get("confidence"), "PENDIENTE")
+        if a not in lookup or b not in lookup or a == b or kind not in RELATION_TYPES or confidence not in CONFIDENCE_LEVELS:
+            raise ValueError("Selecciona dos actores distintos y un vínculo válido.")
+        if kind in (*PERSONAL_RELATIONS, *HIERARCHY_RELATIONS) and any(lookup[key]["entity_type"] != "PERSONA" for key in (a, b)):
+            raise ValueError("Ese vínculo requiere dos personas.")
+        evidence_ids = values.get("evidence_ids") or []
+        if not isinstance(evidence_ids, list) or not set(evidence_ids).issubset({row["evidence_id"] for row in updated.get("evidences", [])}):
+            raise ValueError("La evidencia seleccionada no pertenece al expediente.")
+        source = text_value(values.get("source"), "Captura manual")
+        description = text_value(values.get("description"))
+        visual_color = text_value(values.get("visual_color"), "#d65761")
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", visual_color):
+            raise ValueError("Color de vínculo inválido.")
+        duplicate = any(row.get("source_id") == a and row.get("target_id") == b and row.get("relation_type") == kind
+            and row.get("source") == source and row.get("description") == description and row.get("confidence") == confidence
+            and row.get("status") != "DESCARTADA" and row.get("source_type") == "MANUAL" for row in updated["relationships"])
+        if duplicate:
+            message = "Este vínculo ya estaba registrado."
+        else:
+            relation_id = add_manual_relation_to_state(updated, a, b, kind, source=source, description=description,
+                confidence=confidence, evidence_ids=evidence_ids)
+            next(row for row in updated["relationships"] if row["relation_id"] == relation_id)["visual_color"] = visual_color
+            message = "Vínculo guardado. Su dirección va del origen al destino."
+        selected = a
+    elif operation == "discard":
+        relation_id = text_value(values.get("relation_id"))
+        row = next((r for r in updated["relationships"] if r["relation_id"] == relation_id), None)
+        if not row or row.get("source_type") != "MANUAL":
+            raise ValueError("Solo puedes descartar aquí vínculos manuales.")
+        row["status"] = "DESCARTADA"
+        append_audit(updated, "DESCARTAR_VINCULO_VISUAL", row["relation_type"], object_id=relation_id)
+        message = "Vínculo descartado; se conserva en el historial."
+    elif operation not in {"move", "arrange"}:
+        raise ValueError("Operación del editor no reconocida.")
+
+    if operation == "arrange":
+        updated.setdefault("canvas_positions", {})[mode] = {}
+        updated.setdefault("canvas_sizes", {}).pop(mode, None)
+        append_audit(updated, "ORDENAR_DIAGRAMA", mode)
+        message = "Diagrama ordenado automáticamente."
+    else:
+        positions = event.get("positions", {})
+        if not isinstance(positions, dict) or len(positions) > 500:
+            raise ValueError("Posiciones de diagrama inválidas.")
+        all_ids = set(entity_lookup(updated))
+        checked = {}
+        for key, point in positions.items():
+            if key not in all_ids or not isinstance(point, list) or len(point) != 2:
+                raise ValueError("Posición sin actor válido.")
+            if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 100000 for v in point):
+                raise ValueError("Posición fuera del lienzo.")
+            checked[key] = [float(point[0]), float(point[1])]
+        if operation == "create" and selected:
+            point = event.get("point")
+            if not isinstance(point, list) or len(point) != 2 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 <= v <= 100000 for v in point):
+                raise ValueError("Punto de creación inválido.")
+            checked[selected] = point
+        updated.setdefault("canvas_positions", {}).setdefault(mode, {}).update(checked)
+        size = event.get("size", [1120, 680])
+        if not isinstance(size, list) or len(size) != 2 or any(not isinstance(v, (int, float)) or not math.isfinite(v) or not 200 <= v <= 110000 for v in size):
+            raise ValueError("Dimensiones del lienzo inválidas.")
+        updated.setdefault("canvas_sizes", {})[mode] = size
+        if operation == "move":
+            append_audit(updated, "MOVER_ACTORES", f"{len(checked)} posiciones guardadas · {mode}")
+            message = "Posiciones guardadas."
+    updated["canvas_revision"] = int(state.get("canvas_revision", 0)) + 1
+    if selected:
+        updated["canvas_selection"] = selected
+    updated["canvas_applied"] = (state.get("canvas_applied", []) + [action_id])[-1000:]
+    return updated, {"id": action_id, "ok": True, "message": message, "selected": selected, "operation": operation}
+
+
+@st.cache_resource(show_spinner=False)
+def canvas_component(markup: str):
+    """Serve a bundled component generated by this one Python module."""
+    directory = Path(tempfile.mkdtemp(prefix="sentinel_canvas_5_2_"))
+    (directory / "index.html").write_text(markup.replace("__GRAPH_DATA__", "null"), encoding="utf-8")
+    return components.declare_component("sentinel_canvas_5_2", path=str(directory))
+
+
+def render_canvas_editor(state: dict, payload: dict) -> None:
+    payload["editable"] = True
+    payload["revision"] = int(state.get("canvas_revision", 0))
+    payload["case_id"] = state.get("case_id")
+    payload["actor_types"] = list(ENTITY_TYPES)
+    payload["relation_types"] = list(RELATION_TYPES)
+    payload["hierarchy_types"] = list(HIERARCHY_RELATIONS)
+    payload["personal_types"] = list(PERSONAL_RELATIONS)
+    payload["profile_fields"] = list(PROFILE_FIELDS)
+    payload["confidence_levels"] = list(CONFIDENCE_LEVELS)
+    payload["evidence_options"] = [{"id": row["evidence_id"], "title": row.get("title", row["evidence_id"])} for row in state.get("evidences", []) if row.get("evidence_type") == "MANUAL"]
+    ack_key = "gm_canvas_ack_" + state["case_id"]
+    event = canvas_component(DIAGRAM_HTML)(payload=payload, ack=st.session_state.get(ack_key), default=None, key="gm_canvas_" + state["case_id"] + "_" + payload["mode"] + "_" + APP_VERSION)
+    if not isinstance(event, dict) or not event.get("action_id") or event["action_id"] == (st.session_state.get(ack_key) or {}).get("id"):
+        return
+    try:
+        updated, ack = apply_canvas_action(state, event)
+        if not ack.get("duplicate"):
+            set_state(updated)
+            if event.get("operation") == "create":
+                st.session_state["gm_canvas_reveal"] = ack.get("selected")
+    except (ValueError, TypeError, KeyError, OverflowError) as error:
+        ack = {"id": event["action_id"], "ok": False, "message": str(error)}
+    st.session_state[ack_key] = ack
+    st.rerun()
+
+
 def diagram_layout(rows: list[dict], relations: list[dict], mode: str, focus: str = "", compare: str = "") -> tuple[dict, float, float, list[str]]:
     """Deterministic layouts; hierarchy comes only from explicit hierarchy edges."""
     ids = [row["entity_id"] for row in rows]
@@ -933,6 +1143,17 @@ def diagram_layout(rows: list[dict], relations: list[dict], mode: str, focus: st
 def diagram_payload(state: dict, entities: pd.DataFrame, relations: pd.DataFrame, *, focus: str = "", compare: str = "", mode: str = "red") -> dict:
     rows, rels = entities.to_dict("records"), relations.to_dict("records")
     positions, width, height, messages = diagram_layout(rows, rels, mode, focus, compare)
+    saved = state.get("canvas_positions", {}).get(mode, {})
+    for key in positions:
+        point = saved.get(key)
+        if isinstance(point, list) and len(point) == 2 and all(isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 100000 for v in point):
+            positions[key] = point
+    if saved:
+        size = state.get("canvas_sizes", {}).get(mode, [width, height])
+        if isinstance(size, list) and len(size) == 2 and all(isinstance(v, (int, float)) and math.isfinite(v) and 200 <= v <= 110000 for v in size):
+            width, height = size
+        width = max(width, max((point[0] + 150 for point in positions.values()), default=width))
+        height = max(height, max((point[1] + 150 for point in positions.values()), default=height))
     lookup = entity_lookup(state)
     evidence_lookup = {row["evidence_id"]: row for row in state.get("evidences", [])}
     connections = defaultdict(list)
@@ -954,6 +1175,10 @@ def diagram_payload(state: dict, entities: pd.DataFrame, relations: pd.DataFrame
             support_ids.update(filter(None, text_value(link["evidence_ids"]).split(",")))
         nodes.append({**{k: text_value(row.get(k)) for k in ("entity_id", "entity_type", "label", "confidence", "source_type", "source_detail", "notes")},
             "photo": portrait_uri(state, row), "alias": text_value(metadata.get("alias")), "role": text_value(metadata.get("role")),
+            "metadata": {key: text_value(metadata.get(key)) for key, _ in PROFILE_FIELDS},
+            "visual_color": metadata.get("visual_color") if re.fullmatch(r"#[0-9A-Fa-f]{6}", text_value(metadata.get("visual_color"))) else "#216e7a",
+            "visual_shape": "hexagon" if metadata.get("visual_shape") == "hexagon" else "circle", "visual_group": text_value(metadata.get("visual_group")),
+            "own_evidence_ids": list(filter(None, text_value(row.get("evidence_ids")).split(","))),
             "organization": text_value(metadata.get("organization")), "fields": {label: text_value(metadata.get(key)) for key, label in PROFILE_FIELDS if text_value(metadata.get(key))},
             "x": positions[row["entity_id"]][0], "y": positions[row["entity_id"]][1],
             "icon": ENTITY_ICONS.get(row.get("entity_type"), "•"), "color": ENTITY_COLORS.get(row.get("entity_type"), "#64748b"),
@@ -963,9 +1188,10 @@ def diagram_payload(state: dict, entities: pd.DataFrame, relations: pd.DataFrame
     # Consolidate repeated displayed edges, keeping every underlying relationship ID.
     edge_groups = {}
     for rel in rels:
-        key = tuple(text_value(rel.get(k)) for k in ("source_id", "target_id", "relation_type", "source_type", "confidence"))
+        key = tuple(text_value(rel.get(k)) for k in ("source_id", "target_id", "relation_type", "source_type", "confidence", "visual_color"))
         if key not in edge_groups:
             edge_groups[key] = {**rel, "relation_ids": [], "records": 0}
+            edge_groups[key]["visual_color"] = rel.get("visual_color") if re.fullmatch(r"#[0-9A-Fa-f]{6}", text_value(rel.get("visual_color"))) else ""
         edge_groups[key]["relation_ids"].append(rel["relation_id"])
         edge_groups[key]["records"] += 1
     return {"nodes": nodes, "edges": list(edge_groups.values()), "width": width, "height": height,
@@ -1004,14 +1230,30 @@ button,input{font:inherit}button{cursor:pointer}button:focus-visible,input:focus
 .link-card p{font-size:11px;margin:6px 0 0}.footer{display:flex;gap:18px;align-items:center;padding:11px 17px;border-top:1px solid #e0e9ef;background:#fff;font-size:10px;color:#6b7f8d;flex-wrap:wrap}
 .swatch{display:inline-block;width:16px;border-top:2px solid;vertical-align:middle;margin-right:5px}.footer .count{margin-left:auto}
 #message{display:none;padding:9px 16px;background:#fff6de;color:#816011;font-size:12px}
+#palette{display:none;width:126px;flex-shrink:0;padding:14px 9px;border-right:1px solid #dce8ee;background:#f3f8fa;overflow:auto}
+#palette h3{font-size:13px;margin:0 0 4px}#palette p{font-size:10px;color:#6f8592;line-height:1.4;margin:0 0 12px}
+.actor-tool{display:flex;align-items:center;gap:7px;width:100%;padding:9px 6px;margin:5px 0;border:1px solid #dbe7ed;border-radius:9px;background:white;color:#244858;text-align:left;cursor:grab;font-size:10px;line-height:1.25}
+.actor-tool:hover{border-color:#16968c;background:#ecf8f5}.actor-tool svg{width:25px;height:25px;flex-shrink:0}.actor-tool:disabled{opacity:.4;cursor:default}
+.editor-only{display:none}.editor .editor-only{display:inline-block}.editor #palette{display:block}
+#editorNote{display:none;padding:10px 17px;background:#edf8f5;border-bottom:1px solid #d5e9e3;color:#29655d;font-size:12px;line-height:1.4}
+.editor #editorNote{display:block}.node .connect-port{cursor:crosshair;fill:#fff;stroke:#12867e;stroke-width:2}.node .connect-port:hover{fill:#a4e5db}
+#detail form label{display:block;font-size:11px;color:#55717e;margin:12px 0 5px}
+#detail form input:not([type=checkbox]),#detail form select,#detail form textarea{width:100%;font:13px Arial,sans-serif;border:1px solid #ccdce4;border-radius:7px;padding:8px;background:#fff;color:#17384c;box-sizing:border-box}
+#detail form input:read-only{background:#eef2f5}#detail form input[type=color]{height:35px;padding:3px}
+#detail form textarea{min-height:70px;resize:vertical}#detail form select[multiple]{min-height:65px}
+#detail .primary{padding:10px 12px;background:#137e77;color:#fff;border:0;border-radius:8px;font-weight:600;margin:14px 7px 0 0;cursor:pointer}
+#detail .danger{color:#ac3544;border:1px solid #e9bac1;background:#fff;border-radius:8px;padding:8px;margin-top:15px}
+#detail button:disabled{opacity:.6;cursor:wait}.editor .hint{display:none}#emptyHelp{fill:#718992;font:16px Arial,sans-serif}
+@media(max-width:760px){#palette{width:82px;padding:10px 5px}.actor-tool{flex-direction:column;text-align:center;padding:8px 2px;font-size:9px}#palette p{font-size:9px}.editor #detail{width:285px}}
 @media(max-width:760px){#detail{width:250px;position:absolute;right:0;top:0;bottom:0;box-shadow:-6px 0 20px #1232}.tools{margin-left:0}.bar{padding:10px}.hint{max-width:60%}.footer{gap:9px}}
 </style></head><body><div id="app">
 <header class="bar"><div><div class="brand">SENTINEL · IDENTIDADES</div><div class="title" id="viewTitle"></div></div>
 <div class="tools"><input id="search" type="search" placeholder="Buscar nombre o alias" aria-label="Buscar entidad">
 <button id="zoomIn" aria-label="Acercar" title="Acercar">+</button><button id="zoomOut" aria-label="Alejar" title="Alejar">−</button>
 <button id="fit" title="Restaurar encuadre y selección">Encuadrar</button><button id="labels" aria-pressed="false" title="Mostrar tipos de relación">Vínculos</button>
+<button id="connect" class="editor-only" title="Selecciona origen y destino">Conectar</button><button id="arrange" class="editor-only" title="Ordenar los actores automáticamente">Ordenar</button>
 <button id="export" title="Descargar la vista actual con fotografías">SVG ↓</button></div></header>
-<div id="message" role="status"></div><div class="main"><section class="stage">
+<div id="editorNote" role="status"></div><div id="message" role="status"></div><div class="main"><nav id="palette" aria-label="Paleta de actores"></nav><section class="stage">
 <svg id="canvas" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="Diagrama interactivo de identidades">
 <defs id="defs"><marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8" fill="#7eaacb"/></marker>
 <marker id="arrowRed" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4.5 L0,9" fill="#d65761"/></marker>
@@ -1019,16 +1261,23 @@ button,input{font:inherit}button{cursor:pointer}button:focus-visible,input:focus
 <g id="viewport"><g id="edges"></g><g id="nodes"></g></g></svg>
 <div class="hint">Clic: ficha · Arrastra: mover nodo o lienzo · Rueda: zoom</div></section>
 <aside id="detail" class="hidden" aria-live="polite" aria-label="Ficha de entidad"></aside></div>
-<footer class="footer"><span><i class="swatch" style="color:#7eaacb"></i>Importado / CDR</span><span><i class="swatch" style="color:#d65761"></i>Manual</span>
+<footer class="footer"><span>Color de vínculos personalizable · consulta origen en la ficha</span>
 <span><i class="swatch" style="color:#cc922b;border-top-style:dashed"></i>Inferido</span><span>Punteado: probable o pendiente</span><span class="count" id="count"></span></footer></div>
 <script id="graphData" type="application/json">__GRAPH_DATA__</script>
 <script>
 'use strict';
-const data=JSON.parse(document.getElementById('graphData').textContent);
+const initialData=JSON.parse(document.getElementById('graphData').textContent);
+const blueprint=document.getElementById('app').innerHTML;
+let parentOrigin='*',lastRender='',ui={selected:'',draft:null,pending:null,linkSource:'',connecting:false,view:null,lastAck:''};
+function post(type,values){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},values||{}),parentOrigin);}
+function mount(data,ack){
+document.getElementById('app').innerHTML=blueprint;
+document.getElementById('app').classList.toggle('editor',!!data.editable);
+if(ack&&ack.id!==ui.lastAck&&(!ui.pending||ack.id===ui.pending.action_id)){if(ack.ok){ui.draft=null;ui.selected=ack.selected||ui.selected;ui.connecting=false;ui.linkSource='';}ui.pending=null;ui.lastAck=ack.id;}
 const byId=new Map(data.nodes.map(n=>[n.entity_id,n]));
 const NS='http://www.w3.org/2000/svg', $=id=>document.getElementById(id);
 const canvas=$('canvas'), viewport=$('viewport'), panel=$('detail');
-let selected='',labels=false,zoom=1,tx=0,ty=0,drag=null,edgeElements=[],nodeElements=new Map();
+let selected='',labels=false,zoom=1,tx=0,ty=0,drag=null,edgeElements=[],nodeElements=new Map(),connectionDrag=null;
 function element(tag,attrs,parent){const el=document.createElementNS(NS,tag);Object.entries(attrs||{}).forEach(([k,v])=>el.setAttribute(k,v));if(parent)parent.appendChild(el);return el;}
 function text(parent,value,attrs){const el=element('text',attrs,parent);el.textContent=value;return el;}
 function html(tag,value,parent,className){const el=document.createElement(tag);if(value!==undefined)el.textContent=value;if(className)el.className=className;if(parent)parent.appendChild(el);return el;}
@@ -1036,17 +1285,18 @@ function initials(name){return name.trim().split(/\s+/).slice(0,2).map(s=>s[0]||
 function shorten(s,n){s=String(s||'');return s.length>n?s.slice(0,n-1)+'…':s;}
 function wrap(s,length,limit){let out=[],line='';String(s||'').split(/\s+/).forEach(word=>{if((line+' '+word).trim().length>length&&line){out.push(line);line=word;}else{line=(line+' '+word).trim();}});if(line)out.push(line);if(out.length>limit){out=out.slice(0,limit);out[limit-1]=shorten(out[limit-1],length-1)+'…';}return out.map(v=>shorten(v,length));}
 function radius(n){return data.mode==='organigrama'?42:n.entity_type==='PERSONA'?34:24;}
-function transform(){viewport.setAttribute('transform','translate('+tx+' '+ty+') scale('+zoom+')');}
+function transform(){viewport.setAttribute('transform','translate('+tx+' '+ty+') scale('+zoom+')');ui.view={zoom,tx,ty};}
 function fit(){zoom=1;tx=0;ty=0;transform();}
-function closePanel(){selected='';panel.classList.add('hidden');highlight();}
+function closePanel(){selected='';ui.selected='';ui.draft=null;panel.classList.add('hidden');highlight();}
 function field(parent,key,value){if(!value)return;html('dt',key,parent);html('dd',String(value),parent);}
 function highlight(){const neighbours=new Set([selected]);data.edges.forEach(r=>{if(r.source_id===selected)neighbours.add(r.target_id);if(r.target_id===selected)neighbours.add(r.source_id);});
  nodeElements.forEach((g,id)=>{g.classList.toggle('selected',id===selected);g.classList.toggle('muted',!!selected&&!neighbours.has(id));});
  edgeElements.forEach(e=>e.g.classList.toggle('muted',!!selected&&e.r.source_id!==selected&&e.r.target_id!==selected));}
-function detail(id){const n=byId.get(id);if(!n)return;selected=id;panel.replaceChildren();panel.classList.remove('hidden');
+function detail(id){const n=byId.get(id);if(!n)return;selected=id;ui.selected=id;ui.draft=null;panel.replaceChildren();panel.classList.remove('hidden');
  const close=html('button','Cerrar ×',panel,'light');close.style.float='right';close.onclick=closePanel;
  if(n.photo){const photo=html('img',undefined,panel,'portrait');photo.src=n.photo;photo.alt='Fotografía registrada de '+n.label;}else{html('div',initials(n.label),panel,'portrait initials');}
  html('h2',n.label,panel);if(n.alias)html('p','Alias: '+n.alias,panel,'muted-text');
+ if(data.editable){const edit=html('button','Editar ficha',panel,'primary');edit.onclick=()=>actorForm(n.entity_type,null,n);const link=html('button','Conectar',panel,'light');link.onclick=()=>startConnect(id);}
  html('span',n.entity_type,panel,'badge');html('span',n.confidence||'PENDIENTE',panel,'badge'+(n.confidence==='CONFIRMADO'?'':' pending'));
  const dl=html('dl',undefined,panel);Object.entries(n.fields).forEach(([k,v])=>field(dl,k,v));
  field(dl,'Origen',n.source_type);field(dl,'Fuente de la ficha',n.source_detail);field(dl,'ID de entidad',n.entity_id);
@@ -1059,11 +1309,116 @@ function detail(id){const n=byId.get(id);if(!n)return;selected=id;panel.replaceC
  if(l.start||l.end)html('p','Vigencia: '+(l.start||'Sin fecha')+' → '+(l.end||'Abierta'),card,'muted-text');
  html('p','Evidencias: '+(l.evidence_ids||'Sin evidencia vinculada'),card,'muted-text');});
  html('h3','Evidencias · '+n.evidence.length,panel);n.evidence.forEach(e=>{const card=html('div',undefined,panel,'link-card');html('strong',e.title,card);html('p',e.id+' · '+e.source,card,'muted-text');});
- html('p','Para guardar cambios, utiliza «Fichas de personas» debajo del diagrama.',panel,'muted-text');highlight();}
+ html('p',data.editable?'Edita la ficha o conecta este actor con otro desde aquí.':'Vista de consulta. Abre el expediente en la aplicación para editar.',panel,'muted-text');highlight();}
 function edgeDetail(r){panel.replaceChildren();panel.classList.remove('hidden');const close=html('button','Cerrar ×',panel,'light');close.onclick=closePanel;
  html('h2',r.relation_type.replaceAll('_',' '),panel);html('p',byId.get(r.source_id).label+' → '+byId.get(r.target_id).label,panel);
  const dl=html('dl',undefined,panel);[['Origen',r.source_type],['Confianza',r.confidence],['Fuente',r.source],['Detalle de fuente',r.source_detail],['Descripción',r.description],['Soporte CDR',r.support_count],['Evidencias',r.evidence_ids],['Desde',r.start_date],['Hasta',r.end_date],['Registros agrupados',r.records]].forEach(([k,v])=>field(dl,k,v));
- html('p','ID: '+r.relation_ids.join(', '),panel,'muted-text');}
+ html('p','ID: '+r.relation_ids.join(', '),panel,'muted-text');
+ if(data.editable&&r.source_type==='MANUAL'&&r.relation_ids.length===1){const discard=html('button','Descartar vínculo',panel,'danger');discard.onclick=()=>send('discard',{values:{relation_id:r.relation_ids[0]}});}}
+function note(value,error){$('editorNote').textContent=value;$('editorNote').style.background=error?'#fff0ec':'#edf8f5';}
+function currentPositions(){return Object.fromEntries(data.nodes.map(n=>[n.entity_id,[n.x,n.y]]));}
+function send(operation,extra){if(!data.editable||ui.pending)return;
+ const action_id=typeof crypto.randomUUID==='function'?crypto.randomUUID():Date.now()+'-'+Math.random().toString(36).slice(2);
+ const event=Object.assign({action_id,operation,case_id:data.case_id,revision:data.revision,mode:data.mode,positions:currentPositions(),size:[data.width,data.height]},extra||{});
+ ui.pending=event;document.querySelectorAll('#app button,#app input,#app select,#app textarea').forEach(el=>el.disabled=true);
+ note('Guardando el cambio…');post('streamlit:setComponentValue',{value:event,dataType:'json'});}
+function activateNode(id){if(ui.pending)return;if(data.editable&&ui.connecting){if(!ui.linkSource){startConnect(id);return;}if(id===ui.linkSource){note('Selecciona otro actor como destino.');return;}relationForm(ui.linkSource,id);ui.connecting=false;ui.linkSource='';return;}detail(id);}
+function startConnect(id){ui.draft=null;ui.connecting=true;ui.linkSource=id||'';panel.classList.add('hidden');selected=id||'';highlight();note(id?'Origen: '+byId.get(id).label+'. Ahora pulsa el actor de destino.':'Pulsa el actor de origen y después el de destino.');}
+const iconPaths={
+ 'PERSONA':'<circle cx="12" cy="7" r="4"/><path d="M4 22v-3a8 8 0 0 1 16 0v3"/>',
+ 'TELEFONO':'<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 5h4M10 19h4"/>',
+ 'IMEI':'<rect x="4" y="4" width="16" height="16" rx="2"/><path d="M8 1v3m4-3v3m4-3v3M8 20v3m4-3v3m4-3v3M1 8h3m-3 4h3m-3 4h3m16-8h3m-3 4h3m-3 4h3"/><rect x="8" y="8" width="8" height="8"/>',
+ 'IMSI/SIM':'<path d="M8 2h10v20H5V6z"/><rect x="8" y="10" width="7" height="8"/>',
+ 'PERFIL DIGITAL':'<circle cx="12" cy="12" r="10"/><ellipse cx="12" cy="12" rx="5" ry="10"/><path d="M2 12h20"/>',
+ 'CORREO ELECTRONICO':'<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m2 5 10 8L22 5"/>',
+ 'VEHICULO':'<path d="m4 10 3-6h10l3 6v10H4zM4 10h16M7 14h2m6 0h2M6 20v2m12-2v2"/>',
+ 'DOMICILIO':'<path d="m2 11 10-9 10 9M5 9v13h14V9M10 22v-8h4v8"/>',
+ 'EMPRESA':'<path d="M4 22V4l16-2v20zM8 7h2m4 0h2M8 11h2m4 0h2M8 15h2m4 0h2M10 22v-4h4v4"/>',
+ 'ANTENA':'<path d="m7 22 5-13 5 13M5 4a10 10 0 0 0 0 12M19 4a10 10 0 0 1 0 12M8 7a5 5 0 0 0 0 6m8-6a5 5 0 0 1 0 6"/><circle cx="12" cy="10" r="2"/>',
+ 'UBICACION':'<path d="M12 22S3 13 3 9a9 9 0 0 1 18 0c0 4-9 13-9 13z"/><circle cx="12" cy="9" r="3"/>',
+ 'EVIDENCIA':'<path d="M5 2h10l5 5v15H5zM15 2v6h5M8 12h9M8 16h9"/>',
+ 'EVENTO':'<circle cx="12" cy="12" r="10"/><path d="M12 5v7l5 3"/>',
+ 'CASO':'<path d="M2 6V3h8l3 3h9v15H2z"/>'};
+function actorIcon(kind){return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'+(iconPaths[kind]||iconPaths.PERSONA)+'</svg>';}
+function setupEditor(){const palette=$('palette');html('h3','Actores',palette);html('p','Arrastra un icono al lienzo o pulsa para añadir.',palette);
+ data.actor_types.forEach(kind=>{const btn=html('button',undefined,palette,'actor-tool');btn.type='button';btn.draggable=true;btn.dataset.actor=kind;btn.title='Añadir '+kind.toLocaleLowerCase('es');btn.setAttribute('aria-label','Añadir '+kind);
+ const icon=html('span',undefined,btn);icon.innerHTML=actorIcon(kind);html('span',kind.toLocaleLowerCase('es'),btn);
+ if(data.mode==='organigrama'&&kind!=='PERSONA'){btn.disabled=true;btn.title='Disponible en Red de vínculos';}
+ btn.addEventListener('dragstart',ev=>{if(ui.pending){ev.preventDefault();return;}ev.dataTransfer.setData('text/plain',kind);ev.dataTransfer.effectAllowed='copy';});
+ btn.onclick=()=>{if(ui.pending)return;actorForm(kind,[Math.max(50,(data.width/2-tx)/zoom),Math.max(50,(data.height/2-ty)/zoom)]);};});
+ if(data.mode==='organigrama')html('p','Personas, empresas y otros actores juntos: usa Red de vínculos.',palette);
+ canvas.addEventListener('dragover',ev=>{if(!ui.pending){ev.preventDefault();ev.dataTransfer.dropEffect='copy';}});
+ canvas.addEventListener('drop',ev=>{ev.preventDefault();if(ui.pending)return;const kind=ev.dataTransfer.getData('text/plain');if(!data.actor_types.includes(kind))return;
+ if(data.mode==='organigrama'&&kind!=='PERSONA'){note('Añade empresas y otros actores en Red de vínculos.',true);return;}const p=point(ev);actorForm(kind,[Math.max(50,(p.x-tx)/zoom),Math.max(50,(p.y-ty)/zoom)]);});
+ $('connect').onclick=()=>startConnect(selected);$('arrange').onclick=()=>{ui.view=null;ui.selected='';send('arrange',{});};
+ note('1. Arrastra un actor · 2. Completa su ficha · 3. Conecta dos actores. Los cambios se guardan en el expediente de esta sesión.');
+ if(!data.nodes.length){text(viewport,'Arrastra aquí una persona, empresa u otro actor',{id:'emptyHelp',x:data.width/2,y:data.height/2,'text-anchor':'middle'});}
+}
+function formInput(parent,label,name,value,kind){const id='editor-'+name.replaceAll('.','-');const caption=html('label',label,parent);caption.htmlFor=id;
+ const el=html(kind==='textarea'?'textarea':'input',undefined,parent);el.id=id;el.name=name;if(kind!=='textarea')el.type=kind||'text';if(value!==undefined&&value!==null)el.value=value;return el;}
+function formSelect(parent,label,name,options,value,multiple){const caption=html('label',label,parent);caption.htmlFor='editor-'+name;
+ const el=html('select',undefined,parent);el.id='editor-'+name;el.name=name;el.multiple=!!multiple;
+ options.forEach(option=>{const key=typeof option==='string'?option:option[0],title=typeof option==='string'?option:option[1];const opt=html('option',title,el);opt.value=key;opt.selected=multiple?(value||[]).includes(key):value===key;});return el;}
+function evidenceSelect(form,selectedIds){const options=new Map((data.evidence_options||[]).map(e=>[e.id,e.title+' · '+e.id]));
+ (selectedIds||[]).forEach(id=>{if(!options.has(id))options.set(id,id);});return formSelect(form,'Evidencias vinculadas (opcional)','evidence_ids',[...options],selectedIds||[],true);}
+function actorForm(kind,dropPoint,existing,seed){if(ui.pending)return;
+ const initial=seed||{label:existing?existing.label:'',source:existing?existing.source_detail:'Captura manual',confidence:existing?existing.confidence:'PENDIENTE',
+ notes:existing?existing.notes:'',evidence_ids:existing?existing.own_evidence_ids:[],metadata:Object.assign({},existing?existing.metadata:{},{visual_color:existing?existing.visual_color:'#216e7a',visual_shape:existing?existing.visual_shape:'circle',visual_group:existing?existing.visual_group:''}),photo_data:'',photo_name:'',photo_source:''};
+ ui.draft={kind:'actor',type:kind,id:existing?existing.entity_id:'',point:dropPoint,values:initial};ui.connecting=false;ui.linkSource='';
+ panel.replaceChildren();panel.classList.remove('hidden');const close=html('button','Cancelar',panel,'light');close.onclick=closePanel;
+ html('h2',existing?'Editar actor':'Nuevo actor',panel);html('p',kind.replaceAll('_',' '),panel,'muted-text');
+ const form=html('form',undefined,panel);form.id='actorForm';
+ const name=formInput(form,kind==='PERSONA'?'Nombre completo':'Nombre / identificador','label',initial.label);name.required=true;name.maxLength=500;
+ if(existing&&['TELEFONO','IMEI','IMSI/SIM','CORREO ELECTRONICO','ANTENA'].includes(kind))name.readOnly=true;
+ const alias=formInput(form,'Alias / referencia','metadata.alias',(initial.metadata||{}).alias||'');
+ const role=formInput(form,'Cargo / función','metadata.role',(initial.metadata||{}).role||'');
+ const more=html('details',undefined,form);html('summary','Más datos de la ficha',more);
+ data.profile_fields.filter(([key])=>!['alias','role'].includes(key)).forEach(([key,label])=>formInput(more,label,'metadata.'+key,(initial.metadata||{})[key]||'',key==='other_details'?'textarea':'text'));
+ formInput(form,'Grupo visual (opcional)','metadata.visual_group',(initial.metadata||{}).visual_group||'');
+ formInput(form,'Color del actor','metadata.visual_color',(initial.metadata||{}).visual_color||'#216e7a','color');
+ formSelect(form,'Forma','metadata.visual_shape',[['circle','Círculo'],['hexagon','Hexágono']],(initial.metadata||{}).visual_shape||'circle');
+ const source=formInput(form,'Fuente / referencia','source',initial.source||'Captura manual');source.required=true;
+ const confidence=formSelect(form,'Confianza','confidence',data.confidence_levels,initial.confidence||'PENDIENTE');
+ if(existing&&kind!=='PERSONA'&&existing.source_type!=='MANUAL'){source.readOnly=true;confidence.disabled=true;}
+ formInput(form,'Observaciones','notes',initial.notes||'','textarea');evidenceSelect(form,initial.evidence_ids);
+ let photoData=initial.photo_data||'',photoName=initial.photo_name||'',readingPhoto=false;
+ {
+ const photo=formInput(form,kind==='PERSONA'?'Fotografía (hasta 5 MB)':'Imagen / logotipo (hasta 5 MB)','photo_file','','file');photo.accept='image/png,image/jpeg,image/webp';
+ const fileNote=html('p',photoName||(existing&&existing.photo?'Fotografía actual conservada.':'Fotografía opcional.'),form,'muted-text');
+ formInput(form,'Fuente de la fotografía','photo_source',initial.photo_source||'');
+ photo.onchange=()=>{const file=photo.files[0];if(!file)return;if(file.size>5*1024*1024){note('La fotografía supera 5 MB.',true);photo.value='';return;}
+ readingPhoto=true;fileNote.textContent='Leyendo fotografía…';const reader=new FileReader();reader.onload=()=>{readingPhoto=false;photoData=reader.result;photoName=file.name;fileNote.textContent=file.name;remember();};reader.onerror=()=>{readingPhoto=false;note('No se pudo leer la fotografía.',true);};reader.readAsDataURL(file);};
+ if(existing&&existing.photo){const label=html('label',undefined,form);const remove=html('input',undefined,label);remove.type='checkbox';remove.name='remove_photo';remove.checked=!!initial.remove_photo;label.appendChild(document.createTextNode(' Retirar fotografía actual'));}
+ }
+ const submit=html('button',existing?'Guardar cambios':'Crear actor',form,'primary');submit.type='submit';
+ function collect(){const fd=new FormData(form),metadata={};for(const [key,value] of fd.entries())if(key.startsWith('metadata.'))metadata[key.slice(9)]=String(value);
+ return {entity_type:kind,label:String(fd.get('label')||''),source:String(fd.get('source')||'Captura manual'),confidence:String(fd.get('confidence')||initial.confidence||'PENDIENTE'),notes:String(fd.get('notes')||''),metadata,evidence_ids:fd.getAll('evidence_ids'),photo_data:photoData,photo_name:photoName,photo_source:String(fd.get('photo_source')||fd.get('source')||'Captura manual'),remove_photo:fd.get('remove_photo')==='on'};}
+ function remember(){if(ui.draft&&ui.draft.kind==='actor')ui.draft.values=collect();}
+ form.oninput=remember;form.onchange=remember;
+ form.onsubmit=ev=>{ev.preventDefault();if(readingPhoto){note('Espera a que termine de leer la fotografía.',true);return;}remember();send(existing?'edit':'create',{entity_id:existing?existing.entity_id:'',point:dropPoint,values:collect()});};
+ note(existing?'Edita los valores y pulsa Guardar cambios.':'Completa el nombre y pulsa Crear actor. El actor aparecerá donde lo soltaste.');
+ name.focus();
+}
+function relationForm(sourceId,targetId,seed){if(ui.pending)return;const a=byId.get(sourceId),b=byId.get(targetId);if(!a||!b||sourceId===targetId)return;
+ const people=a.entity_type==='PERSONA'&&b.entity_type==='PERSONA';
+ const types=data.relation_types.filter(kind=>people||!data.personal_types.includes(kind)&&!data.hierarchy_types.includes(kind));
+ const defaultKind=data.mode==='organigrama'?'DIRIGE_A':a.entity_type==='PERSONA'&&b.entity_type==='TELEFONO'?'UTILIZA':'RELACION_DOCUMENTAL';
+ const initial=seed||{relation_type:defaultKind,source:'Captura manual',confidence:'PENDIENTE',description:'',evidence_ids:[],visual_color:'#d65761'};
+ ui.draft={kind:'relation',source:sourceId,target:targetId,values:initial};ui.connecting=false;ui.linkSource='';panel.replaceChildren();panel.classList.remove('hidden');
+ const cancel=html('button','Cancelar',panel,'light');cancel.onclick=closePanel;html('h2','Nuevo vínculo',panel);html('p',a.label+' → '+b.label,panel);
+ if(people)html('p','Para crear una jerarquía elige Dirige a o Supervisa a. La flecha saldrá del superior hacia el dependiente.',panel,'muted-text');
+ const form=html('form',undefined,panel);form.id='relationForm';
+ formSelect(form,'Tipo de vínculo','relation_type',types.map(kind=>[kind,kind.replaceAll('_',' ').toLocaleLowerCase('es')]),initial.relation_type);
+ formInput(form,'Fuente / referencia','source',initial.source||'Captura manual').required=true;
+ formSelect(form,'Confianza','confidence',data.confidence_levels,initial.confidence||'PENDIENTE');
+ formInput(form,'Color del vínculo','visual_color',initial.visual_color||'#d65761','color');
+ formInput(form,'Descripción del vínculo','description',initial.description||'','textarea');evidenceSelect(form,initial.evidence_ids||[]);
+ const submit=html('button','Guardar vínculo',form,'primary');submit.type='submit';
+ function collect(){const fd=new FormData(form);return {source_id:sourceId,target_id:targetId,relation_type:fd.get('relation_type'),source:fd.get('source'),confidence:fd.get('confidence'),description:fd.get('description'),visual_color:fd.get('visual_color'),evidence_ids:fd.getAll('evidence_ids')};}
+ form.oninput=()=>{if(ui.draft)ui.draft.values=collect();};form.onchange=form.oninput;
+ form.onsubmit=ev=>{ev.preventDefault();ui.draft.values=collect();send('connect',{values:collect()});};
+ note('Define la relación entre los dos actores y guarda el vínculo.');
+}
 function drawEdges(){edgeElements.forEach(e=>{const a=byId.get(e.r.source_id),b=byId.get(e.r.target_id),dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy)||1;
  const org=data.mode==='organigrama';let x1=a.x+dx/len*(radius(a)+4),y1=a.y+dy/len*(radius(a)+4),x2=b.x-dx/len*(radius(b)+9),y2=b.y-dy/len*(radius(b)+9);
  let d='M'+x1+','+y1+' L'+x2+','+y2;
@@ -1072,32 +1427,37 @@ function drawEdges(){edgeElements.forEach(e=>{const a=byId.get(e.r.source_id),b=
 function build(){canvas.setAttribute('viewBox','0 0 '+data.width+' '+data.height);
  data.edges.forEach(r=>{if(!byId.has(r.source_id)||!byId.has(r.target_id))return;const g=element('g',{'class':'edge'},$('edges'));
  const inferred=r.source_type==='INFERIDO'||r.confidence==='INFERIDO',manual=r.source_type==='MANUAL';
- const color=inferred?'#cc922b':manual?'#d65761':'#7eaacb';
+ const color=inferred?'#cc922b':r.visual_color||(manual?'#d65761':'#7eaacb');
+ const markerId='edgeArrow'+color.slice(1);if(!$(markerId)){const marker=element('marker',{id:markerId,markerWidth:9,markerHeight:9,refX:8,refY:4.5,orient:'auto-start-reverse',markerUnits:'userSpaceOnUse'},$('defs'));element('path',{d:'M0,0 L9,4.5 L0,9',fill:color},marker);}
  const uncertain=['PROBABLE','PENDIENTE','INFERIDO'].includes(r.confidence);
- const path=element('path',{fill:'none',stroke:color,'stroke-width':data.mode==='organigrama'?2.8:1.3+Math.min(4,Math.log2(1+Number(r.support_count||0))*.7),'stroke-dasharray':inferred?'7 5':uncertain?'3 4':'','marker-end':'url(#'+(inferred?'arrowGold':manual?'arrowRed':'arrowBlue')+')',opacity:manual?.83:.62},g);
+ const path=element('path',{fill:'none',stroke:color,'stroke-width':data.mode==='organigrama'?2.8:1.3+Math.min(4,Math.log2(1+Number(r.support_count||0))*.7),'stroke-dasharray':inferred?'7 5':uncertain?'3 4':'','marker-end':'url(#'+markerId+')',opacity:manual?.83:.62},g);
  const hit=element('path',{fill:'none',stroke:'transparent','stroke-width':14},g);
  const label=text(g,r.relation_type.replaceAll('_',' '),{'class':'edge-label','text-anchor':'middle',display:'none'});
  g.addEventListener('click',ev=>{if(drag&&drag.moved)return;ev.stopPropagation();edgeDetail(r);});edgeElements.push({r,g,path,hit,label});});
  data.nodes.forEach((n,index)=>{const r=radius(n),g=element('g',{'class':'node',transform:'translate('+n.x+' '+n.y+')',tabindex:0,role:'button','aria-label':n.label+', abrir ficha','data-id':n.entity_id},$('nodes'));nodeElements.set(n.entity_id,g);
  element('circle',{r:r+7,fill:'#fff',stroke:'#dfe9ee','stroke-width':1.5,'class':'halo'},g);
- element('circle',{r,fill:n.entity_type==='PERSONA'?'#e7f1f1':n.color+'18',stroke:n.entity_type==='PERSONA'?'#214950':n.color,'stroke-width':2.3},g);
- if(n.photo){const clip=element('clipPath',{id:'photo'+index},$('defs'));element('circle',{r:r-2},clip);element('image',{x:-r+2,y:-r+2,width:(r-2)*2,height:(r-2)*2,href:n.photo,preserveAspectRatio:'xMidYMid slice','clip-path':'url(#photo'+index+')'},g);}
- else{text(g,n.entity_type==='PERSONA'?initials(n.label):n.icon,{y:7,'text-anchor':'middle','font-size':n.entity_type==='PERSONA'?22:20,fill:'#236166','font-family':'Arial,sans-serif','font-weight':600});}
+ const hex=n.visual_shape==='hexagon';const hexPoints=Array.from({length:6},(_,i)=>{const angle=Math.PI/3*i;return Math.cos(angle)*r+','+Math.sin(angle)*r;}).join(' ');
+ element(hex?'polygon':'circle',Object.assign(hex?{points:hexPoints}:{r},{fill:n.entity_type==='PERSONA'?'#e7f1f1':n.color+'18',stroke:n.visual_color||n.color,'stroke-width':3}),g);
+ if(n.photo){const clip=element('clipPath',{id:'photo'+index},$('defs'));element(hex?'polygon':'circle',hex?{points:hexPoints,transform:'scale(.93)'}:{r:r-2},clip);element('image',{x:-r+2,y:-r+2,width:(r-2)*2,height:(r-2)*2,href:n.photo,preserveAspectRatio:'xMidYMid slice','clip-path':'url(#photo'+index+')'},g);}
+ else if(n.entity_type==='PERSONA'){text(g,initials(n.label),{y:7,'text-anchor':'middle','font-size':22,fill:'#236166','font-family':'Arial,sans-serif','font-weight':600});}
+ else{const icon=element('svg',{x:-14,y:-14,width:28,height:28,viewBox:'0 0 24 24',fill:'none',stroke:n.visual_color||n.color,'stroke-width':1.6,'stroke-linecap':'round','stroke-linejoin':'round'},g);icon.innerHTML=iconPaths[n.entity_type]||iconPaths.CASO;}
  const lines=wrap(n.label,data.mode==='organigrama'?25:22,2);lines.forEach((line,i)=>text(g,line,{y:r+24+i*16,'text-anchor':'middle','class':data.mode==='organigrama'?'label org':'label'}));
- const description=data.mode==='organigrama'?[n.role,n.organization].filter(Boolean).join(' · '):n.alias||n.role||n.entity_type;
+ const description=data.mode==='organigrama'?[n.role,n.organization].filter(Boolean).join(' · '):n.visual_group||n.alias||n.role||n.entity_type;
  wrap(description,28,data.mode==='organigrama'?2:1).forEach((line,i)=>text(g,line,{y:r+28+lines.length*16+i*14,'text-anchor':'middle','class':data.mode==='organigrama'?'sub org':'sub'}));
  const title=element('title',{},g);title.textContent=n.label+(n.role?' · '+n.role:'');
- g.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;ev.stopPropagation();const p=point(ev);drag={node:n,start:p,x:n.x,y:n.y,screenX:ev.clientX,screenY:ev.clientY,moved:false};canvas.setPointerCapture(ev.pointerId);});
- g.addEventListener('click',ev=>{ev.stopPropagation();if(!drag||!drag.moved)detail(n.entity_id);});
- g.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();detail(n.entity_id);}});});
+ if(data.editable){const port=element('circle',{cx:r+12,cy:0,r:6,'class':'connect-port',role:'button','aria-label':'Conectar desde '+n.label},g);port.addEventListener('pointerdown',ev=>{if(ui.pending)return;ev.preventDefault();ev.stopPropagation();connectionDrag={id:n.entity_id,path:element('path',{d:'',fill:'none',stroke:'#14978c','stroke-width':2,'stroke-dasharray':'6 4'},viewport)};canvas.setPointerCapture(ev.pointerId);});}
+ g.addEventListener('pointerdown',ev=>{if(ev.button!==0||ui.pending)return;ev.stopPropagation();const p=point(ev);drag={node:n,start:p,x:n.x,y:n.y,screenX:ev.clientX,screenY:ev.clientY,moved:false};canvas.setPointerCapture(ev.pointerId);});
+ g.addEventListener('click',ev=>ev.stopPropagation());
+ g.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();activateNode(n.entity_id);}});});
  drawEdges();}
 function point(ev){const p=new DOMPoint(ev.clientX,ev.clientY);return p.matrixTransform(canvas.getScreenCTM().inverse());}
-canvas.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;const p=point(ev);drag={start:p,x:tx,y:ty,screenX:ev.clientX,screenY:ev.clientY,moved:false};canvas.setPointerCapture(ev.pointerId);});
-canvas.addEventListener('pointermove',ev=>{if(!drag)return;const p=point(ev);if(Math.hypot(ev.clientX-drag.screenX,ev.clientY-drag.screenY)>3)drag.moved=true;
- if(drag.node){drag.node.x=drag.x+(p.x-drag.start.x)/zoom;drag.node.y=drag.y+(p.y-drag.start.y)/zoom;nodeElements.get(drag.node.entity_id).setAttribute('transform','translate('+drag.node.x+' '+drag.node.y+')');drawEdges();}
+canvas.addEventListener('pointerdown',ev=>{if(ev.button!==0||ui.pending)return;const p=point(ev);drag={start:p,x:tx,y:ty,screenX:ev.clientX,screenY:ev.clientY,moved:false};canvas.setPointerCapture(ev.pointerId);});
+canvas.addEventListener('pointermove',ev=>{const p=point(ev);if(connectionDrag){const n=byId.get(connectionDrag.id);connectionDrag.path.setAttribute('d','M'+n.x+','+n.y+' L'+((p.x-tx)/zoom)+','+((p.y-ty)/zoom));return;}if(!drag)return;if(Math.hypot(ev.clientX-drag.screenX,ev.clientY-drag.screenY)>3)drag.moved=true;
+ if(drag.node){drag.node.x=Math.max(50,drag.x+(p.x-drag.start.x)/zoom);drag.node.y=Math.max(50,drag.y+(p.y-drag.start.y)/zoom);nodeElements.get(drag.node.entity_id).setAttribute('transform','translate('+drag.node.x+' '+drag.node.y+')');drawEdges();}
  else{tx=drag.x+p.x-drag.start.x;ty=drag.y+p.y-drag.start.y;transform();}});
-canvas.addEventListener('pointerup',ev=>{if(drag&&drag.node&&!drag.moved)detail(drag.node.entity_id);if(canvas.hasPointerCapture(ev.pointerId))canvas.releasePointerCapture(ev.pointerId);setTimeout(()=>{drag=null;},0);});
-canvas.addEventListener('pointercancel',()=>{drag=null;});
+canvas.addEventListener('pointerup',ev=>{if(connectionDrag){const p=point(ev),x=(p.x-tx)/zoom,y=(p.y-ty)/zoom;const target=data.nodes.find(n=>n.entity_id!==connectionDrag.id&&Math.hypot(n.x-x,n.y-y)<radius(n)+24);const source=connectionDrag.id;connectionDrag.path.remove();connectionDrag=null;if(target)relationForm(source,target.entity_id);else note('Suelta el conector sobre otro actor.');}
+ else if(drag&&drag.node){if(!drag.moved)activateNode(drag.node.entity_id);else if(data.editable)send('move',{});}if(canvas.hasPointerCapture(ev.pointerId))canvas.releasePointerCapture(ev.pointerId);drag=null;});
+canvas.addEventListener('pointercancel',()=>{drag=null;if(connectionDrag)connectionDrag.path.remove();connectionDrag=null;});
 function zoomAt(factor,p){const next=Math.max(.2,Math.min(8,zoom*factor));tx=p.x-(p.x-tx)*next/zoom;ty=p.y-(p.y-ty)*next/zoom;zoom=next;transform();}
 canvas.addEventListener('wheel',ev=>{ev.preventDefault();zoomAt(ev.deltaY<0?1.12:1/1.12,point(ev));},{passive:false});
 $('zoomIn').onclick=()=>zoomAt(1.25,{x:data.width/2,y:data.height/2});$('zoomOut').onclick=()=>zoomAt(.8,{x:data.width/2,y:data.height/2});
@@ -1113,8 +1473,14 @@ $('export').onclick=()=>{const svg=canvas.cloneNode(true);svg.setAttribute('widt
 $('viewTitle').textContent=(data.mode==='organigrama'?'Organigrama':'Red de vínculos')+' / '+data.case_name;
 $('count').textContent=data.nodes.length+' entidades · '+data.edges.length+' vínculos';
 if(data.messages.length){$('message').textContent=data.messages.join(' ');$('message').style.display='block';}
-build();if(data.focus&&byId.has(data.focus))detail(data.focus);
-document.addEventListener('keydown',ev=>{if(ev.key==='Escape')closePanel();});
+build();if(ui.view){zoom=ui.view.zoom;tx=ui.view.tx;ty=ui.view.ty;transform();}
+if(data.editable){setupEditor();if(ui.draft){if(ui.draft.kind==='actor')actorForm(ui.draft.type,ui.draft.point,byId.get(ui.draft.id),ui.draft.values);else relationForm(ui.draft.source,ui.draft.target,ui.draft.values);}else if(byId.has(ui.selected))detail(ui.selected);if(ack)note(ack.message,!ack.ok);}
+else if(data.focus&&byId.has(data.focus))detail(data.focus);
+document.onkeydown=ev=>{if(ev.key==='Escape'){ui.connecting=false;ui.linkSource='';closePanel();if(data.editable)note('Arrastra un actor al lienzo, completa su ficha y conéctalo.');}};
+}
+if(initialData){mount(initialData,null);}else{
+window.addEventListener('message',event=>{if(event.source!==window.parent||!event.data||event.data.type!=='streamlit:render')return;parentOrigin=event.origin;const args=event.data.args||{};if(!args.payload)return;const signature=JSON.stringify([args.payload,args.ack]);if(signature===lastRender)return;lastRender=signature;mount(args.payload,args.ack);post('streamlit:setFrameHeight',{height:820});});
+post('streamlit:componentReady',{apiVersion:1});post('streamlit:setFrameHeight',{height:820});}
 </script></body></html>'''
 
 
@@ -1414,7 +1780,7 @@ def render_case_loader() -> None:
 def render_identity_legend() -> None:
     pills = "".join(f'<span style="display:inline-flex;align-items:center;gap:.3rem;margin:.2rem .35rem .2rem 0;padding:.25rem .55rem;border-radius:999px;background:{ENTITY_COLORS.get(kind, "#64748b")}18;color:#334155;font-size:.8rem"><span>{ENTITY_ICONS.get(kind, "•")}</span>{escape(kind)}</span>' for kind in ENTITY_TYPES)
     st.markdown(f'<div style="padding:.5rem 0 .8rem">{pills}</div>', unsafe_allow_html=True)
-    st.caption("Azul: dato importado / CDR · rojo: relación manual · ámbar: inferencia. Punteado: pendiente o probable. Se excluyen los vínculos descartados. Una comunicación no acredita parentesco ni titularidad.")
+    st.caption("Los iconos identifican el tipo de actor. Los colores son editables; consulta el origen y la confianza en la ficha del vínculo. Ámbar discontinuo: inferencia. Punteado: pendiente o probable. Se excluyen los vínculos descartados. Una comunicación no acredita parentesco ni titularidad.")
 
 
 def render_case_exports(state: dict) -> None:
@@ -1438,7 +1804,7 @@ def map_view_data(state: dict, focus: str, compare: str, depth: int, minimum: in
     total = len(entities)
     if total > limit:
         degree = Counter(relations["source_id"].tolist() + relations["target_id"].tolist())
-        selected = sorted(entities["entity_id"], key=lambda key: (key not in {focus, compare}, -degree[key], key))[:limit]
+        selected = sorted(entities["entity_id"], key=lambda key: (key not in {focus, compare, state.get("canvas_selection")}, -degree[key], key))[:limit]
         entities = entities[entities["entity_id"].isin(selected)]
         relations = relations[relations["source_id"].isin(selected) & relations["target_id"].isin(selected)]
     return entities, relations, total
@@ -1528,7 +1894,10 @@ def render_person_editor(state: dict) -> None:
 
 
 def render_identity_tab(state: dict) -> None:
-    render_section("Mapa de identidad", "Fotografías, vínculos y fichas documentadas. Selecciona un nodo para consultar su detalle.", "01")
+    render_section("Editor de diagrama", "Arrastra actores al lienzo, completa sus fichas y conecta sus vínculos aquí mismo.", "01")
+    if st.session_state.pop("gm_canvas_reveal", None):
+        for key in ("gm_graph_focus", "gm_graph_compare", "gm_graph_scope", "gm_graph_types", "gm_graph_sources"):
+            st.session_state.pop(key, None)
     mode_label = st.radio("Distribución del diagrama", ["Red de vínculos", "Organigrama"], horizontal=True, key="gm_graph_layout")
     mode = "organigrama" if mode_label == "Organigrama" else "red"
     source_options = sorted(set(SOURCE_TYPES) | set(x.get("source_type", "") for x in state.get("relationships", [])))
@@ -1563,16 +1932,17 @@ def render_identity_tab(state: dict) -> None:
     limit = g.select_slider("Máximo de nodos", options=[20, 40, 60, 80, 120, 160, 200, 300], value=80, key="gm_graph_limit")
     if mode == "organigrama":
         compare = ""
-        st.caption("Niveles definidos por DIRIGE_A, SUPERVISA_A, COORDINA_A, REPORTA_A o SUBORDINADO_DE. Registra estas relaciones en Edición manual; el cargo escrito no genera flechas.")
+        st.caption("Conecta dos personas con Dirige a o Supervisa a y pulsa Ordenar para disponer los niveles. Usa Red de vínculos para mezclar personas, empresas y otros actores.")
     else:
         st.caption("Elige dos centros para separar sus vecinos y colocar los contactos directos comunes entre ambos. Amplía los saltos para explorar sus atributos y comunicaciones.")
     visible_entities, visible_relations, total = map_view_data(state, focus, compare, int(depth), int(minimum), sources, types, mode, int(limit))
     if total > limit:
         st.info(f"Se muestran {len(visible_entities)} de {total} entidades que coinciden con los filtros. Se priorizan los centros seleccionados y las entidades más conectadas. El expediente conserva todos los registros.")
     html = identity_html(visible_entities, visible_relations, focus=focus, compare=compare, mode=mode, state=state)
-    components.html(html, height=780, scrolling=False)
+    payload = diagram_payload(state, visible_entities, visible_relations, focus=focus, compare=compare, mode=mode)
+    render_canvas_editor(state, payload)
     st.download_button("Descargar diagrama interactivo (HTML)", html.encode("utf-8"), f"sentinel_{mode}.html", "text/html", key="gm_diagram_download", disabled=visible_entities.empty)
-    st.caption("Clic en una persona: consultar su ficha. Para editarla, abre «Fichas de personas» y selecciona su nombre. El HTML permite consultar la vista sin conexión; JSON y Excel conservan el expediente editable y las fotos originales.")
+    st.caption("Los cambios y posiciones quedan guardados en esta sesión. Descarga el expediente JSON o Excel para continuar después o en otro equipo. El HTML es una copia de consulta del diagrama.")
     render_kpi_row([
         {"label": "Entidades visibles", "value": len(visible_entities), "tone": "primary"},
         {"label": "Relaciones visibles", "value": len(visible_relations)},
@@ -1885,6 +2255,9 @@ def main() -> None:
     state = get_state()
     if state is None:
         render_info_panel("Comienza con un expediente", "Carga Excel/CSV CDR o elige Expediente manual para empezar con personas y fotografías. Después completa las fichas y registra los vínculos que forman la red o el organigrama.", "info")
+        if st.button("Crear diagrama vacío", type="primary", key="gm_start_canvas"):
+            set_state(new_state("Diagrama de investigación"))
+            st.rerun()
         return
     render_exports_and_notice(state)
     tabs = st.tabs(["Mapa de identidad", "Comunicaciones", "Relaciones personales", "Relaciones y soporte", "Cronología", "Mapa geográfico", "Evidencias", "Análisis", "Edición manual"])
