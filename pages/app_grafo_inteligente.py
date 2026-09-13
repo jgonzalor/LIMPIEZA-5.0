@@ -1,4 +1,4 @@
-"""Sentinel Mapa Investigativo: identidad, comunicaciones y evidencia.
+"""Sentinel 5.1.0: red de vínculos, organigrama y fichas con fotografía.
 
 La página es deliberadamente autocontenida para que la evolución del módulo no
 toque guardian, navegación, limpieza ni los demás módulos estables de Go Mapper.
@@ -11,12 +11,15 @@ from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from html import escape
 from io import BytesIO
+import base64
+import copy
 import hashlib
 import json
 import math
 import re
 import unicodedata
 import uuid
+import zlib
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -30,7 +33,7 @@ from suite_nav import render_suite_sidebar
 from ui.components import render_info_panel, render_kpi_row, render_page_header, render_section
 
 
-APP_VERSION = "5.0.0-identidades"
+APP_VERSION = "5.1.0-fichas-y-organigrama"
 LOCAL_TZ = "America/Mazatlan"
 VALID_EVENT_TYPES = (
     "DATOS", "DATOS WIFI", "VOZ ENTRANTE", "VOZ SALIENTE", "VOZ TRANSITO",
@@ -49,10 +52,13 @@ PERSONAL_RELATIONS = (
     "SOBRINO_DE", "SOBRINA_DE", "PRIMO_DE", "PRIMA_DE", "PAREJA_DE", "CONYUGE_DE",
     "EX_PAREJA_DE", "FAMILIAR_DE", "AMIGO_DE", "SOCIO_DE", "CONOCIDO_DE", "RELACION_PERSONAL_OTRA",
 )
+HIERARCHY_RELATIONS = ("DIRIGE_A", "SUPERVISA_A", "COORDINA_A", "REPORTA_A", "SUBORDINADO_DE")
+# Stored source → target is preserved; these two relations point up the hierarchy.
+UPWARD_RELATIONS = {"REPORTA_A", "SUBORDINADO_DE"}
 RELATION_TYPES = (
     "UTILIZA", "ASOCIADO_A", "TIENE_PERFIL", "PROPIETARIO_DE", "RESIDE_EN",
     "TRABAJA_EN", "UBICADO_EN", "UTILIZA_ANTENA", "COMUNICACION",
-    *PERSONAL_RELATIONS, "RELACION_DOCUMENTAL",
+    *PERSONAL_RELATIONS, *HIERARCHY_RELATIONS, "RELACION_DOCUMENTAL",
 )
 ENTITY_TYPES = (
     "PERSONA", "TELEFONO", "IMEI", "IMSI/SIM", "PERFIL DIGITAL", "CORREO ELECTRONICO", "VEHICULO",
@@ -241,14 +247,15 @@ def add_entity(state: dict, entity_type: str, label: object, *, source_type: str
                evidence_ids: list[str] | None = None, metadata: dict | None = None) -> str:
     display = text_value(label, "Sin etiqueta")
     normalized = normalize_identifier(display) or norm_text(display)
-    existing = next((x for x in state["entities"] if x["entity_type"] == entity_type and x["normalized"] == normalized), None)
+    # A matching name is not proof of identity. People always receive their own ID.
+    existing = None if entity_type == "PERSONA" else next((x for x in state["entities"] if x["entity_type"] == entity_type and x["normalized"] == normalized), None)
     if existing:
         if evidence_ids:
-            prior = [text_value(existing.get("evidence_ids"))]
+            prior = text_value(existing.get("evidence_ids")).split(",")
             existing["evidence_ids"] = ",".join(sorted(set(filter(None, prior + evidence_ids))))
         return existing["entity_id"]
     record = {
-        "entity_id": entity_id(entity_type, display), "entity_type": entity_type, "label": display,
+        "entity_id": short_id("PERSONA") if entity_type == "PERSONA" else entity_id(entity_type, display), "entity_type": entity_type, "label": display,
         "normalized": normalized, "source_type": source_type, "source_detail": source_detail,
         "created_by": user_name(), "created_at": now_local(), "confidence": confidence,
         "notes": notes, "evidence_ids": ",".join(evidence_ids or []), "metadata": json.dumps(metadata or {}, ensure_ascii=False),
@@ -288,6 +295,7 @@ def new_state(case_name: str = "Caso sin nombre", case_id: str = "") -> dict:
         "case_id": case_id or short_id("CASO"), "case_name": case_name, "created_at": now_local(),
         "entities": [], "relationships": [], "events": [], "support": [], "evidences": [],
         "audit": [], "imports": [], "targets": [], "dedup_tolerance": 30,
+        "assets": {}, "entity_history": [],
     }
 
 
@@ -582,6 +590,42 @@ def state_from_legacy_graph(legacy) -> dict:
     return state
 
 
+def preserve_manual_context(previous: dict, rebuilt: dict) -> dict:
+    """Refresh observed CDR data while keeping documented identities and their support."""
+    manual_relations = [copy.deepcopy(row) for row in previous.get("relationships", []) if row.get("source_type") == "MANUAL"]
+    keep_ids = {row["entity_id"] for row in previous.get("entities", []) if row.get("source_type") == "MANUAL" or row.get("entity_type") == "PERSONA"}
+    for row in manual_relations:
+        keep_ids.update((row["source_id"], row["target_id"]))
+    new_lookup = entity_lookup(rebuilt)
+    needed_evidence = set()
+    for row in previous.get("entities", []):
+        if row["entity_id"] not in keep_ids:
+            continue
+        needed_evidence.update(filter(None, text_value(row.get("evidence_ids")).split(",")))
+        if row["entity_id"] not in new_lookup:
+            rebuilt["entities"].append(copy.deepcopy(row))
+        else:
+            current = new_lookup[row["entity_id"]]
+            ids = set(filter(None, text_value(current.get("evidence_ids")).split(","))) | set(filter(None, text_value(row.get("evidence_ids")).split(",")))
+            current["evidence_ids"] = ",".join(sorted(ids))
+            current["metadata"] = json.dumps({**entity_metadata(current), **entity_metadata(row)}, ensure_ascii=False)
+            if row.get("notes"):
+                current["notes"] = row["notes"]
+    for row in manual_relations:
+        needed_evidence.update(filter(None, text_value(row.get("evidence_ids")).split(",")))
+    existing_evidence = {row["evidence_id"] for row in rebuilt.get("evidences", [])}
+    rebuilt["evidences"].extend(copy.deepcopy(row) for row in previous.get("evidences", [])
+        if row["evidence_id"] not in existing_evidence and (row["evidence_id"] in needed_evidence or row.get("evidence_type") == "MANUAL"))
+    rebuilt["relationships"].extend(manual_relations)
+    rebuilt["assets"] = copy.deepcopy(previous.get("assets", {}))
+    rebuilt["entity_history"] = copy.deepcopy(previous.get("entity_history", []))
+    rebuilt["audit"] = copy.deepcopy(previous.get("audit", [])) + rebuilt["audit"]
+    rebuilt["case_id"] = previous.get("case_id", rebuilt["case_id"])
+    rebuilt["created_at"] = previous.get("created_at", rebuilt["created_at"])
+    append_audit(rebuilt, "RENOVAR_CDR_CON_FICHAS", "Se renovaron los eventos CDR conservando fichas, fotos, atributos manuales y evidencia vinculada.")
+    return rebuilt
+
+
 def project_from_upload(upload) -> dict:
     payload = upload.getvalue() if hasattr(upload, "getvalue") else bytes(upload)
     name = text_value(getattr(upload, "name", ""))
@@ -597,11 +641,25 @@ def project_from_upload(upload) -> dict:
             return state_from_legacy_graph((pd.DataFrame(data.get("nodos", [])), pd.DataFrame(data.get("aristas", [])), pd.DataFrame(data.get("evidencia", []))))
         raise ValueError("JSON sin hojas de identidad reconocibles.")
     book = pd.ExcelFile(BytesIO(payload))
+    if "PROYECTO_JSON" in book.sheet_names:
+        # Excel cells are limited to 32,767 characters. The complete project,
+        # including originals and revision history, uses ordered 30k chunks.
+        snapshot = pd.read_excel(book, sheet_name="PROYECTO_JSON", dtype=str, keep_default_na=False)
+        snapshot = snapshot.assign(_part=pd.to_numeric(snapshot["parte"], errors="raise")).sort_values("_part")
+        encoded = "".join(snapshot["contenido"].tolist())
+        packed = base64.b64decode(encoded, validate=True)
+        decoder = zlib.decompressobj()
+        raw = decoder.decompress(packed, 256 * 1024 * 1024 + 1)
+        if not decoder.eof or len(raw) > 256 * 1024 * 1024:
+            raise ValueError("El proyecto supera 256 MB descomprimido o está incompleto.")
+        if not len(snapshot) or file_hash(raw) != snapshot.iloc[0]["sha256"]:
+            raise ValueError("El expediente no supera la comprobación de integridad.")
+        return json.loads(raw.decode("utf-8"))["identity_state"]
     frames = {sheet.upper(): pd.read_excel(book, sheet_name=sheet, dtype=str, keep_default_na=False).fillna("") for sheet in book.sheet_names}
     if "ENTIDADES" not in frames and "NODOS" in frames:
         return state_from_legacy_graph((frames["NODOS"].rename(columns={"label": "label"}), frames.get("ARISTAS", pd.DataFrame()), frames.get("EVIDENCIA_ORIGINAL", pd.DataFrame())))
     state = new_state(name.rsplit(".", 1)[0] or "Proyecto importado")
-    mapping = {"ENTIDADES": "entities", "RELACIONES": "relationships", "EVENTOS": "events", "SOPORTE_CDR": "support", "EVIDENCIAS": "evidences", "AUDITORIA": "audit"}
+    mapping = {"ENTIDADES": "entities", "RELACIONES": "relationships", "EVENTOS": "events", "SOPORTE_CDR": "support", "EVIDENCIAS": "evidences", "AUDITORIA": "audit", "IMPORTACIONES": "imports"}
     for sheet, key in mapping.items():
         if sheet in frames:
             records = frames[sheet].to_dict("records")
@@ -622,9 +680,12 @@ def get_state() -> dict | None:
 
 
 def set_state(state: dict) -> None:
+    previous = st.session_state.get("gm_identity_state", {})
+    changed_case = previous.get("case_id") != state.get("case_id")
     st.session_state["gm_identity_state"] = state
-    for key in ("gm_graph_focus", "gm_graph_depth", "gm_graph_minimum", "gm_graph_sources"):
-        st.session_state.pop(key, None)
+    if changed_case:
+        for key in ("gm_graph_focus", "gm_graph_compare", "gm_graph_depth", "gm_graph_minimum", "gm_graph_sources", "gm_person_select"):
+            st.session_state.pop(key, None)
     # The tuple keeps backward compatibility with prior tests and saved sessions.
     entities = frame_from_records(state.get("entities", []), ENTITY_COLUMNS)
     relations = frame_from_records(state.get("relationships", []), RELATION_COLUMNS)
@@ -636,6 +697,93 @@ def set_state(state: dict) -> None:
 
 def entity_lookup(state: dict) -> dict[str, dict]:
     return {x["entity_id"]: x for x in state.get("entities", [])}
+
+
+PROFILE_FIELDS = (
+    ("alias", "Alias"), ("role", "Cargo / función"), ("organization", "Organización"),
+    ("birth_date", "Fecha de nacimiento"), ("nationality", "Nacionalidad"),
+    ("identification", "Identificaciones / referencias"), ("address", "Domicilio declarado"),
+    ("occupation", "Ocupación"), ("emails", "Correos electrónicos"),
+    ("profiles", "Perfiles digitales"), ("traits", "Señas particulares"),
+    ("other_details", "Otros datos documentados"),
+)
+
+
+def entity_metadata(entity: dict) -> dict:
+    value = entity.get("metadata", {})
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def prepare_portrait(upload) -> dict:
+    """Keep the original and create a small local preview; no external image URL."""
+    from PIL import Image, ImageOps
+
+    raw = upload.getvalue()
+    if not raw or len(raw) > 5 * 1024 * 1024:
+        raise ValueError("La fotografía debe pesar entre 1 byte y 5 MB.")
+    try:
+        with Image.open(BytesIO(raw)) as original:
+            kind = original.format
+            if kind not in {"PNG", "JPEG", "WEBP"} or original.width * original.height > 20_000_000:
+                raise ValueError("Usa una imagen PNG, JPG o WebP de hasta 20 megapíxeles.")
+            original.load()
+            preview = ImageOps.exif_transpose(original).convert("RGB")
+            preview.thumbnail((512, 512))
+            buf = BytesIO()
+            preview.save(buf, "JPEG", quality=86)
+    except (OSError, Image.DecompressionBombError) as error:
+        raise ValueError("No se pudo leer esa fotografía. Prueba con PNG, JPG o WebP.") from error
+    return {"asset_id": "FOTO_" + file_hash(raw)[:20], "file_name": text_value(getattr(upload, "name", "foto")),
+            "mime_type": {"PNG": "image/png", "JPEG": "image/jpeg", "WEBP": "image/webp"}[kind],
+            "sha256": file_hash(raw), "data": base64.b64encode(raw).decode("ascii"),
+            "preview": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")}
+
+
+def portrait_uri(state: dict, entity: dict) -> str:
+    asset_id = entity_metadata(entity).get("photo_asset", "")
+    candidate = text_value(state.get("assets", {}).get(asset_id, {}).get("preview"))
+    return candidate if len(candidate) <= 1_000_000 and re.fullmatch(r"data:image/(?:jpeg|png|webp);base64,[A-Za-z0-9+/=]+", candidate) else ""
+
+
+def save_person_profile(state: dict, selected_id: str, label: str, metadata: dict, *,
+                        confidence: str, source: str, notes: str, evidence_ids: list[str],
+                        portrait: dict | None = None, photo_source: str = "", remove_photo: bool = False) -> str:
+    """Explicit edit by ID, preserving previous records and photo assets in history."""
+    if not label.strip() or not source.strip():
+        raise ValueError("Escribe el nombre y una fuente para la ficha.")
+    if portrait and not photo_source.strip():
+        raise ValueError("Indica la fuente de la fotografía.")
+    record = entity_lookup(state).get(selected_id) if selected_id else None
+    if selected_id and (not record or record.get("entity_type") != "PERSONA"):
+        raise ValueError("Selecciona una persona existente.")
+    before = copy.deepcopy(record) if record else None
+    if record is None:
+        selected_id = add_entity(state, "PERSONA", label, source_type="MANUAL", source_detail=source, confidence=confidence)
+        record = entity_lookup(state)[selected_id]
+    merged = {**entity_metadata(record), **metadata, "updated_at": now_local(), "updated_by": user_name()}
+    linked_evidence = set(filter(None, evidence_ids))
+    if remove_photo:
+        merged.pop("photo_asset", None)
+    if portrait:
+        state.setdefault("assets", {})[portrait["asset_id"]] = {**portrait, "source": photo_source, "captured_at": now_local()}
+        merged["photo_asset"] = portrait["asset_id"]
+        photo_evidence = add_manual_evidence_to_state(state, f"Fotografía · {label}", photo_source,
+            "Original conservado en el expediente; miniatura para representación del nodo.",
+            json.dumps({"asset_id": portrait["asset_id"], "sha256": portrait["sha256"], "file_name": portrait["file_name"]}, ensure_ascii=False))
+        linked_evidence.add(photo_evidence)
+    record.update({"label": label.strip(), "normalized": normalize_identifier(label), "confidence": confidence,
+                   "source_detail": source.strip(), "notes": notes.strip(), "evidence_ids": ",".join(sorted(linked_evidence)),
+                   "metadata": json.dumps(merged, ensure_ascii=False)})
+    state.setdefault("entity_history", []).append({"revision_id": short_id("REV"), "entity_id": selected_id,
+        "timestamp": now_local(), "user": user_name(), "before": before, "after": copy.deepcopy(record)})
+    append_audit(state, "EDITAR_FICHA" if before else "CREAR_FICHA", f"{label} · fuente: {source}", object_id=selected_id)
+    return selected_id
 
 
 def entity_label(state: dict, entity_id_value: str) -> str:
@@ -661,11 +809,11 @@ def relation_ids(state: dict, entity_id_value: str) -> set[str]:
 def relationship_graph(state: dict, focus: str = "", depth: int = 1, minimum: int = 0, source_filter: list[str] | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     entities = frame_from_records(state.get("entities", []), ENTITY_COLUMNS)
     relations = frame_from_records(state.get("relationships", []), RELATION_COLUMNS)
-    if relations.empty:
-        return entities, relations
-    if source_filter:
+    if source_filter is not None:
         relations = relations[relations["source_type"].isin(source_filter)]
-    relations = relations[pd.to_numeric(relations["support_count"], errors="coerce").fillna(0) >= minimum]
+    relations = relations[(relations["status"] != "DESCARTADA") & (relations["confidence"] != "DESCARTADO")]
+    # A CDR count should not remove a documented family/identity relationship.
+    relations = relations[(relations["relation_type"] != "COMUNICACION") | (pd.to_numeric(relations["support_count"], errors="coerce").fillna(0) >= minimum)]
     if focus:
         visible = {focus}
         frontier = {focus}
@@ -679,45 +827,330 @@ def relationship_graph(state: dict, focus: str = "", depth: int = 1, minimum: in
     return entities.copy(), relations.copy()
 
 
-def identity_html(entities: pd.DataFrame, relations: pd.DataFrame, *, focus: str = "", height: int = 680) -> str:
-    """Render a dependency-free SVG; PyVis remains an optional enhancement."""
-    if entities.empty:
-        return '<div style="padding:3rem;text-align:center;color:#64748b;background:#f8fafc;border-radius:18px">Sin entidades para visualizar.</div>'
-    rows = entities.to_dict("records")
-    count = len(rows)
-    width = 1120
-    center_x, center_y = width / 2, height / 2
-    radius = min(300, max(120, 28 * count))
-    pos = {}
-    for i, row in enumerate(rows):
-        angle = (2 * math.pi * i / max(count, 1)) - math.pi / 2
-        pos[row["entity_id"]] = (center_x + radius * math.cos(angle), center_y + radius * math.sin(angle))
-    lines = []
-    for rel in relations.to_dict("records"):
-        if rel.get("source_id") not in pos or rel.get("target_id") not in pos:
+def diagram_layout(rows: list[dict], relations: list[dict], mode: str, focus: str = "", compare: str = "") -> tuple[dict, float, float, list[str]]:
+    """Deterministic layouts; hierarchy comes only from explicit hierarchy edges."""
+    ids = [row["entity_id"] for row in rows]
+    if not ids:
+        return {}, 1120, 620, []
+    neighbours = {key: set() for key in ids}
+    for rel in relations:
+        a, b = rel.get("source_id"), rel.get("target_id")
+        if a in neighbours and b in neighbours and a != b:
+            neighbours[a].add(b)
+            neighbours[b].add(a)
+    messages = []
+    if mode == "organigrama":
+        children = {key: set() for key in ids}
+        incoming = {key: 0 for key in ids}
+        for rel in relations:
+            if rel.get("relation_type") not in HIERARCHY_RELATIONS:
+                continue
+            a, b = rel["source_id"], rel["target_id"]
+            if rel["relation_type"] in UPWARD_RELATIONS:
+                a, b = b, a
+            if a in children and b in incoming and a != b and b not in children[a]:
+                children[a].add(b)
+                incoming[b] += 1
+        levels = {}
+        queue = sorted(key for key in ids if incoming[key] == 0)
+        for key in queue:
+            levels[key] = 0
+        cursor = 0
+        while cursor < len(queue):
+            key = queue[cursor]
+            cursor += 1
+            for child in sorted(children[key]):
+                levels[child] = max(levels.get(child, 0), levels[key] + 1)
+                incoming[child] -= 1
+                if incoming[child] == 0:
+                    queue.append(child)
+        pending = [key for key in ids if key not in queue]
+        if pending:
+            # Do not invent a hierarchy for cycles or their descendants.
+            last = max(levels.values(), default=0) + 1
+            levels.update({key: last for key in pending})
+            messages.append("Hay un ciclo jerárquico. Los nodos afectados aparecen al final, sin nivel validado; revisa sus relaciones.")
+        connected = {key for key in ids if neighbours[key]}
+        if connected and any(key not in connected for key in ids):
+            last = max((levels[key] for key in connected), default=0) + 1
+            for key in ids:
+                if key not in connected:
+                    levels[key] = last
+            messages.append("Las personas sin relación jerárquica se muestran en la última fila; su posición no asigna un cargo.")
+        groups = defaultdict(list)
+        for key in ids:
+            groups[levels[key]].append(key)
+        width = max(1000, max(len(group) for group in groups.values()) * 230 + 80)
+        height = max(540, len(groups) * 210 + 50)
+        positions = {}
+        for index, level in enumerate(sorted(groups)):
+            group = groups[level]
+            for col, key in enumerate(group):
+                positions[key] = [width / 2 + (col - (len(group) - 1) / 2) * 230, (height / 2 - 30) if len(groups) == 1 else 86 + index * 210]
+        return positions, width, height, messages
+
+    ranked = sorted(ids, key=lambda key: (-len(neighbours[key]), ids.index(key)))
+    primary = focus if focus in ids else next((r["entity_id"] for r in rows if r.get("entity_type") == "PERSONA" and neighbours[r["entity_id"]]), ranked[0])
+    secondary = compare if compare in ids and compare != primary else ""
+    if not secondary:
+        others = [key for key in ranked if key != primary]
+        radius = max(235, len(others) * 100 / (2 * math.pi))
+        width, height = max(1120, radius * 2 + 360), max(620, radius * 2 + 180)
+        positions = {primary: [width / 2, height / 2 - 15]}
+        for index, key in enumerate(others):
+            angle = -math.pi / 2 + 2 * math.pi * index / max(1, len(others))
+            positions[key] = [width / 2 + radius * math.cos(angle), height / 2 - 15 + radius * math.sin(angle)]
+        return positions, width, height, messages
+
+    common = sorted(neighbours[primary] & neighbours[secondary] - {primary, secondary})
+    def distances(root):
+        result, frontier = {root: 0}, [root]
+        for current in frontier:
+            for candidate in sorted(neighbours[current]):
+                if candidate not in result:
+                    result[candidate] = result[current] + 1
+                    frontier.append(candidate)
+        return result
+    left_dist, right_dist = distances(primary), distances(secondary)
+    left, right = [], []
+    for key in ranked:
+        if key in {primary, secondary} or key in common:
             continue
-        x1, y1, x2, y2 = (*pos[rel["source_id"]], *pos[rel["target_id"]])
-        dash = ' stroke-dasharray="7 5"' if rel.get("source_type") in {"MANUAL", "INFERIDO", "DESCARTADO"} else ""
-        color = {"MANUAL": "#e879f9", "INFERIDO": "#f59e0b", "DESCARTADO": "#94a3b8"}.get(rel.get("source_type"), "#a7b8cc")
-        lines.append(f'<line x1="{x1:.1f}" y1="{y1:.1f}" x2="{x2:.1f}" y2="{y2:.1f}" stroke="{color}" stroke-width="{1.2 + min(4, float(rel.get("support_count") or 0) / 4):.1f}"{dash} marker-end="url(#arrow)"/><text x="{(x1+x2)/2:.1f}" y="{(y1+y2)/2:.1f}" font-size="10" fill="#64748b">{escape(text_value(rel.get('relation_type')))}</text>')
-    circles = []
+        (left if left_dist.get(key, math.inf) <= right_dist.get(key, math.inf) else right).append(key)
+    radius = max(245, max(len(left), len(right)) * 105 / math.pi, len(common) * 60)
+    width, height = 4 * radius + 380, 2 * radius + 240
+    lx, rx, cy = radius + 135, 3 * radius + 245, height / 2 - 10
+    positions = {primary: [lx, cy], secondary: [rx, cy]}
+    for index, key in enumerate(common):
+        positions[key] = [width / 2, cy + (index - (len(common) - 1) / 2) * 120]
+    for group, cx, sign in ((left, lx, -1), (right, rx, 1)):
+        for index, key in enumerate(group):
+            angle = -math.pi / 2 + math.pi * (index + .5) / max(len(group), 1)
+            positions[key] = [cx + sign * radius * math.cos(angle), cy + radius * math.sin(angle)]
+    return positions, width, height, messages
+
+
+def diagram_payload(state: dict, entities: pd.DataFrame, relations: pd.DataFrame, *, focus: str = "", compare: str = "", mode: str = "red") -> dict:
+    rows, rels = entities.to_dict("records"), relations.to_dict("records")
+    positions, width, height, messages = diagram_layout(rows, rels, mode, focus, compare)
+    lookup = entity_lookup(state)
+    evidence_lookup = {row["evidence_id"]: row for row in state.get("evidences", [])}
+    connections = defaultdict(list)
+    for rel in state.get("relationships", []):
+        for key, other in ((rel.get("source_id"), rel.get("target_id")), (rel.get("target_id"), rel.get("source_id"))):
+            if key and other in lookup:
+                connections[key].append({"id": other, "label": lookup[other].get("label", other),
+                    "type": lookup[other].get("entity_type", ""), "direction": "→" if key == rel.get("source_id") else "←",
+                    "relation": rel.get("relation_type", ""), "confidence": rel.get("confidence", ""),
+                    "source": rel.get("source", ""), "source_detail": rel.get("source_detail", ""),
+                    "source_type": rel.get("source_type", ""), "status": rel.get("status", ""),
+                    "description": rel.get("description", ""), "evidence_ids": rel.get("evidence_ids", ""),
+                    "start": rel.get("start_date", ""), "end": rel.get("end_date", "")})
+    nodes = []
     for row in rows:
-        x, y = pos[row["entity_id"]]
-        et = row.get("entity_type", "")
-        selected = row["entity_id"] == focus
-        color = ENTITY_COLORS.get(et, "#64748b")
-        label = text_value(row.get("label"), row["entity_id"])
-        short = label if len(label) < 18 else label[:15] + "…"
-        circles.append(f'<g><title>{escape(et)} · {escape(label)}</title><circle cx="{x:.1f}" cy="{y:.1f}" r="{26 if selected else 20}" fill="{color}" stroke="{"#fbbf24" if selected else "#ffffff"}" stroke-width="{4 if selected else 2}"/><text x="{x:.1f}" y="{y+4:.1f}" text-anchor="middle" font-size="18">{escape(ENTITY_ICONS.get(et,"•"))}</text><text x="{x:.1f}" y="{y+38:.1f}" text-anchor="middle" font-size="11" fill="#1e293b">{escape(short)}</text></g>')
-    return f'''<div style="height:{height}px;overflow:hidden;border:1px solid #d8e3ef;border-radius:18px;background:linear-gradient(135deg,#fbfdff,#f1f6fb)"><svg viewBox="0 0 {width} {height}" width="100%" height="100%" role="img" aria-label="Mapa investigativo"><defs><marker id="arrow" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto"><path d="M0,0 L0,6 L7,3 z" fill="#94a3b8"/></marker></defs>{''.join(lines)}{''.join(circles)}</svg></div>'''
+        metadata = entity_metadata(row)
+        support_ids = set(filter(None, text_value(row.get("evidence_ids")).split(",")))
+        for link in connections[row["entity_id"]]:
+            support_ids.update(filter(None, text_value(link["evidence_ids"]).split(",")))
+        nodes.append({**{k: text_value(row.get(k)) for k in ("entity_id", "entity_type", "label", "confidence", "source_type", "source_detail", "notes")},
+            "photo": portrait_uri(state, row), "alias": text_value(metadata.get("alias")), "role": text_value(metadata.get("role")),
+            "organization": text_value(metadata.get("organization")), "fields": {label: text_value(metadata.get(key)) for key, label in PROFILE_FIELDS if text_value(metadata.get(key))},
+            "x": positions[row["entity_id"]][0], "y": positions[row["entity_id"]][1],
+            "icon": ENTITY_ICONS.get(row.get("entity_type"), "•"), "color": ENTITY_COLORS.get(row.get("entity_type"), "#64748b"),
+            "links": connections[row["entity_id"]],
+            "evidence": [{"id": key, "title": evidence_lookup.get(key, {}).get("title", key),
+                          "source": evidence_lookup.get(key, {}).get("source", "")} for key in sorted(support_ids)]})
+    # Consolidate repeated displayed edges, keeping every underlying relationship ID.
+    edge_groups = {}
+    for rel in rels:
+        key = tuple(text_value(rel.get(k)) for k in ("source_id", "target_id", "relation_type", "source_type", "confidence"))
+        if key not in edge_groups:
+            edge_groups[key] = {**rel, "relation_ids": [], "records": 0}
+        edge_groups[key]["relation_ids"].append(rel["relation_id"])
+        edge_groups[key]["records"] += 1
+    return {"nodes": nodes, "edges": list(edge_groups.values()), "width": width, "height": height,
+            "focus": focus, "compare": compare, "mode": mode, "messages": messages,
+            "case_name": text_value(state.get("case_name"), "Mapa de identidad"), "version": APP_VERSION}
+
+
+DIAGRAM_HTML = r'''<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{box-sizing:border-box}body{margin:0;color:#18334b;background:#fff;font-family:Inter,Arial,sans-serif;font-size:13px}
+button,input{font:inherit}button{cursor:pointer}button:focus-visible,input:focus-visible,.node:focus-visible{outline:3px solid #22b8ac;outline-offset:3px}
+#app{height:100vh;min-height:570px;border:1px solid #dbe5ed;border-radius:18px;overflow:hidden;background:#fbfdfe;display:flex;flex-direction:column}
+.bar{display:flex;align-items:center;gap:8px;padding:14px 18px;border-bottom:1px solid #e0e9ef;background:#fff;flex-wrap:wrap}
+.brand{font-size:10px;letter-spacing:2px;color:#158d89;font-weight:800}.title{margin:3px 0 0;font-size:15px;font-weight:750}
+.tools{margin-left:auto;display:flex;gap:6px;align-items:center;flex-wrap:wrap}.tools button,.light{border:1px solid #dbe5ed;background:#fff;color:#29465b;border-radius:8px;padding:7px 10px}
+.tools button:hover,.light:hover{background:#eef8f7;border-color:#73b9b4}.tools input{border:1px solid #dbe5ed;border-radius:8px;padding:8px;width:174px;min-width:90px}
+.main{display:flex;flex:1;min-height:0;position:relative}.stage{flex:1;min-width:0;position:relative;background:radial-gradient(#e4ecf1 .7px,transparent .7px);background-size:18px 18px}
+#canvas{width:100%;height:100%;display:block;touch-action:none;cursor:grab}#canvas:active{cursor:grabbing}
+.node{cursor:pointer}.node text{pointer-events:none}.node.selected .halo{stroke:#119c94;stroke-width:4;fill:#d5f4ee}
+.node.muted{opacity:.22}.edge.muted{opacity:.07}.edge{cursor:pointer}.edge:hover{opacity:1}
+.edge-label{font:10px Arial,sans-serif;fill:#587086;paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}
+.label{font:600 13px Arial,sans-serif;fill:#233e50;paint-order:stroke;stroke:#fff;stroke-width:4px;stroke-linejoin:round}
+.sub{font:11px Arial,sans-serif;fill:#6c7f8e;paint-order:stroke;stroke:#fff;stroke-width:3px;stroke-linejoin:round}
+.label.org{font-size:15px}.sub.org{font-size:13px}
+.hint{position:absolute;left:14px;bottom:12px;font-size:11px;background:#ffffffed;padding:7px 10px;border-radius:7px;pointer-events:none;color:#6a7c8e}
+#detail{width:300px;flex-shrink:0;overflow:auto;padding:20px;background:#fff;border-left:1px solid #e0e9ef}
+#detail.hidden{display:none}#detail h2{font-size:21px;line-height:1.3;margin:12px 0 4px;overflow-wrap:anywhere}
+#detail h3{font-size:10px;letter-spacing:1.7px;text-transform:uppercase;color:#63818c;border-top:1px solid #e6edf2;padding-top:18px;margin-top:20px}
+#detail p{line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap}#detail dl{margin:16px 0}#detail dt{color:#738592;font-size:11px;margin-top:14px}#detail dd{margin:4px 0 0;line-height:1.5;overflow-wrap:anywhere;white-space:pre-wrap}
+.portrait{width:78px;height:78px;object-fit:cover;border-radius:50%;border:3px solid #184a52;background:#eaf5f3}
+.initials{display:grid;place-items:center;font-size:23px;color:#185f64}.badge{display:inline-block;font-size:10px;border-radius:5px;padding:5px 7px;margin:6px 4px 4px 0;background:#e8f5f2;color:#176b64}
+.badge.pending{color:#926612;background:#fff3d6}.muted-text{color:#748694;font-size:11px;line-height:1.5}
+.link-card{border:1px solid #e3ebf0;border-radius:10px;padding:11px;margin:8px 0;background:#fcfdfe}
+.link-card button{border:0;background:none;text-align:left;padding:0;font-weight:600;color:#246886;overflow-wrap:anywhere}
+.link-card p{font-size:11px;margin:6px 0 0}.footer{display:flex;gap:18px;align-items:center;padding:11px 17px;border-top:1px solid #e0e9ef;background:#fff;font-size:10px;color:#6b7f8d;flex-wrap:wrap}
+.swatch{display:inline-block;width:16px;border-top:2px solid;vertical-align:middle;margin-right:5px}.footer .count{margin-left:auto}
+#message{display:none;padding:9px 16px;background:#fff6de;color:#816011;font-size:12px}
+@media(max-width:760px){#detail{width:250px;position:absolute;right:0;top:0;bottom:0;box-shadow:-6px 0 20px #1232}.tools{margin-left:0}.bar{padding:10px}.hint{max-width:60%}.footer{gap:9px}}
+</style></head><body><div id="app">
+<header class="bar"><div><div class="brand">SENTINEL · IDENTIDADES</div><div class="title" id="viewTitle"></div></div>
+<div class="tools"><input id="search" type="search" placeholder="Buscar nombre o alias" aria-label="Buscar entidad">
+<button id="zoomIn" aria-label="Acercar" title="Acercar">+</button><button id="zoomOut" aria-label="Alejar" title="Alejar">−</button>
+<button id="fit" title="Restaurar encuadre y selección">Encuadrar</button><button id="labels" aria-pressed="false" title="Mostrar tipos de relación">Vínculos</button>
+<button id="export" title="Descargar la vista actual con fotografías">SVG ↓</button></div></header>
+<div id="message" role="status"></div><div class="main"><section class="stage">
+<svg id="canvas" xmlns="http://www.w3.org/2000/svg" role="group" aria-label="Diagrama interactivo de identidades">
+<defs id="defs"><marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8" fill="#7eaacb"/></marker>
+<marker id="arrowRed" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L9,4.5 L0,9" fill="#d65761"/></marker>
+<marker id="arrowGold" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto-start-reverse" markerUnits="userSpaceOnUse"><path d="M0,0 L8,4 L0,8" fill="#cc922b"/></marker></defs>
+<g id="viewport"><g id="edges"></g><g id="nodes"></g></g></svg>
+<div class="hint">Clic: ficha · Arrastra: mover nodo o lienzo · Rueda: zoom</div></section>
+<aside id="detail" class="hidden" aria-live="polite" aria-label="Ficha de entidad"></aside></div>
+<footer class="footer"><span><i class="swatch" style="color:#7eaacb"></i>Importado / CDR</span><span><i class="swatch" style="color:#d65761"></i>Manual</span>
+<span><i class="swatch" style="color:#cc922b;border-top-style:dashed"></i>Inferido</span><span>Punteado: probable o pendiente</span><span class="count" id="count"></span></footer></div>
+<script id="graphData" type="application/json">__GRAPH_DATA__</script>
+<script>
+'use strict';
+const data=JSON.parse(document.getElementById('graphData').textContent);
+const byId=new Map(data.nodes.map(n=>[n.entity_id,n]));
+const NS='http://www.w3.org/2000/svg', $=id=>document.getElementById(id);
+const canvas=$('canvas'), viewport=$('viewport'), panel=$('detail');
+let selected='',labels=false,zoom=1,tx=0,ty=0,drag=null,edgeElements=[],nodeElements=new Map();
+function element(tag,attrs,parent){const el=document.createElementNS(NS,tag);Object.entries(attrs||{}).forEach(([k,v])=>el.setAttribute(k,v));if(parent)parent.appendChild(el);return el;}
+function text(parent,value,attrs){const el=element('text',attrs,parent);el.textContent=value;return el;}
+function html(tag,value,parent,className){const el=document.createElement(tag);if(value!==undefined)el.textContent=value;if(className)el.className=className;if(parent)parent.appendChild(el);return el;}
+function initials(name){return name.trim().split(/\s+/).slice(0,2).map(s=>s[0]||'').join('').toUpperCase();}
+function shorten(s,n){s=String(s||'');return s.length>n?s.slice(0,n-1)+'…':s;}
+function wrap(s,length,limit){let out=[],line='';String(s||'').split(/\s+/).forEach(word=>{if((line+' '+word).trim().length>length&&line){out.push(line);line=word;}else{line=(line+' '+word).trim();}});if(line)out.push(line);if(out.length>limit){out=out.slice(0,limit);out[limit-1]=shorten(out[limit-1],length-1)+'…';}return out.map(v=>shorten(v,length));}
+function radius(n){return data.mode==='organigrama'?42:n.entity_type==='PERSONA'?34:24;}
+function transform(){viewport.setAttribute('transform','translate('+tx+' '+ty+') scale('+zoom+')');}
+function fit(){zoom=1;tx=0;ty=0;transform();}
+function closePanel(){selected='';panel.classList.add('hidden');highlight();}
+function field(parent,key,value){if(!value)return;html('dt',key,parent);html('dd',String(value),parent);}
+function highlight(){const neighbours=new Set([selected]);data.edges.forEach(r=>{if(r.source_id===selected)neighbours.add(r.target_id);if(r.target_id===selected)neighbours.add(r.source_id);});
+ nodeElements.forEach((g,id)=>{g.classList.toggle('selected',id===selected);g.classList.toggle('muted',!!selected&&!neighbours.has(id));});
+ edgeElements.forEach(e=>e.g.classList.toggle('muted',!!selected&&e.r.source_id!==selected&&e.r.target_id!==selected));}
+function detail(id){const n=byId.get(id);if(!n)return;selected=id;panel.replaceChildren();panel.classList.remove('hidden');
+ const close=html('button','Cerrar ×',panel,'light');close.style.float='right';close.onclick=closePanel;
+ if(n.photo){const photo=html('img',undefined,panel,'portrait');photo.src=n.photo;photo.alt='Fotografía registrada de '+n.label;}else{html('div',initials(n.label),panel,'portrait initials');}
+ html('h2',n.label,panel);if(n.alias)html('p','Alias: '+n.alias,panel,'muted-text');
+ html('span',n.entity_type,panel,'badge');html('span',n.confidence||'PENDIENTE',panel,'badge'+(n.confidence==='CONFIRMADO'?'':' pending'));
+ const dl=html('dl',undefined,panel);Object.entries(n.fields).forEach(([k,v])=>field(dl,k,v));
+ field(dl,'Origen',n.source_type);field(dl,'Fuente de la ficha',n.source_detail);field(dl,'ID de entidad',n.entity_id);
+ if(n.notes){html('h3','Observaciones',panel);html('p',n.notes,panel);}
+ html('h3','Relaciones registradas · '+n.links.length,panel);
+ if(!n.links.length)html('p','Sin vínculos registrados. Añádelos en la ficha editable o en Edición manual.',panel,'muted-text');
+ n.links.forEach(l=>{const card=html('div',undefined,panel,'link-card');const btn=html('button',l.direction+' '+l.label,card);btn.onclick=()=>{if(byId.has(l.id))detail(l.id);else html('p','Entidad fuera de esta vista. Amplía los saltos o selecciónala en los filtros.',card,'muted-text');};
+ html('p',l.relation.replaceAll('_',' ')+' · '+l.type,card);html('p',l.source_type+' · '+l.confidence+(l.status==='DESCARTADA'?' · DESCARTADA':''),card,'muted-text');
+ if(l.description)html('p',l.description,card);html('p','Fuente: '+(l.source||l.source_detail||'No registrada'),card,'muted-text');
+ if(l.start||l.end)html('p','Vigencia: '+(l.start||'Sin fecha')+' → '+(l.end||'Abierta'),card,'muted-text');
+ html('p','Evidencias: '+(l.evidence_ids||'Sin evidencia vinculada'),card,'muted-text');});
+ html('h3','Evidencias · '+n.evidence.length,panel);n.evidence.forEach(e=>{const card=html('div',undefined,panel,'link-card');html('strong',e.title,card);html('p',e.id+' · '+e.source,card,'muted-text');});
+ html('p','Para guardar cambios, utiliza «Fichas de personas» debajo del diagrama.',panel,'muted-text');highlight();}
+function edgeDetail(r){panel.replaceChildren();panel.classList.remove('hidden');const close=html('button','Cerrar ×',panel,'light');close.onclick=closePanel;
+ html('h2',r.relation_type.replaceAll('_',' '),panel);html('p',byId.get(r.source_id).label+' → '+byId.get(r.target_id).label,panel);
+ const dl=html('dl',undefined,panel);[['Origen',r.source_type],['Confianza',r.confidence],['Fuente',r.source],['Detalle de fuente',r.source_detail],['Descripción',r.description],['Soporte CDR',r.support_count],['Evidencias',r.evidence_ids],['Desde',r.start_date],['Hasta',r.end_date],['Registros agrupados',r.records]].forEach(([k,v])=>field(dl,k,v));
+ html('p','ID: '+r.relation_ids.join(', '),panel,'muted-text');}
+function drawEdges(){edgeElements.forEach(e=>{const a=byId.get(e.r.source_id),b=byId.get(e.r.target_id),dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy)||1;
+ const org=data.mode==='organigrama';let x1=a.x+dx/len*(radius(a)+4),y1=a.y+dy/len*(radius(a)+4),x2=b.x-dx/len*(radius(b)+9),y2=b.y-dy/len*(radius(b)+9);
+ let d='M'+x1+','+y1+' L'+x2+','+y2;
+ if(org&&Math.abs(dy)>100){const downward=dy>0;y1=a.y+(downward?133:-radius(a)-5);x1=a.x;x2=b.x;y2=b.y+(downward?-radius(b)-10:133);const mid=(y1+y2)/2;d='M'+x1+','+y1+' V'+mid+' H'+x2+' V'+y2;}
+ e.path.setAttribute('d',d);e.hit.setAttribute('d',d);e.label.setAttribute('x',(x1+x2)/2);e.label.setAttribute('y',(y1+y2)/2-7);});}
+function build(){canvas.setAttribute('viewBox','0 0 '+data.width+' '+data.height);
+ data.edges.forEach(r=>{if(!byId.has(r.source_id)||!byId.has(r.target_id))return;const g=element('g',{'class':'edge'},$('edges'));
+ const inferred=r.source_type==='INFERIDO'||r.confidence==='INFERIDO',manual=r.source_type==='MANUAL';
+ const color=inferred?'#cc922b':manual?'#d65761':'#7eaacb';
+ const uncertain=['PROBABLE','PENDIENTE','INFERIDO'].includes(r.confidence);
+ const path=element('path',{fill:'none',stroke:color,'stroke-width':data.mode==='organigrama'?2.8:1.3+Math.min(4,Math.log2(1+Number(r.support_count||0))*.7),'stroke-dasharray':inferred?'7 5':uncertain?'3 4':'','marker-end':'url(#'+(inferred?'arrowGold':manual?'arrowRed':'arrowBlue')+')',opacity:manual?.83:.62},g);
+ const hit=element('path',{fill:'none',stroke:'transparent','stroke-width':14},g);
+ const label=text(g,r.relation_type.replaceAll('_',' '),{'class':'edge-label','text-anchor':'middle',display:'none'});
+ g.addEventListener('click',ev=>{if(drag&&drag.moved)return;ev.stopPropagation();edgeDetail(r);});edgeElements.push({r,g,path,hit,label});});
+ data.nodes.forEach((n,index)=>{const r=radius(n),g=element('g',{'class':'node',transform:'translate('+n.x+' '+n.y+')',tabindex:0,role:'button','aria-label':n.label+', abrir ficha','data-id':n.entity_id},$('nodes'));nodeElements.set(n.entity_id,g);
+ element('circle',{r:r+7,fill:'#fff',stroke:'#dfe9ee','stroke-width':1.5,'class':'halo'},g);
+ element('circle',{r,fill:n.entity_type==='PERSONA'?'#e7f1f1':n.color+'18',stroke:n.entity_type==='PERSONA'?'#214950':n.color,'stroke-width':2.3},g);
+ if(n.photo){const clip=element('clipPath',{id:'photo'+index},$('defs'));element('circle',{r:r-2},clip);element('image',{x:-r+2,y:-r+2,width:(r-2)*2,height:(r-2)*2,href:n.photo,preserveAspectRatio:'xMidYMid slice','clip-path':'url(#photo'+index+')'},g);}
+ else{text(g,n.entity_type==='PERSONA'?initials(n.label):n.icon,{y:7,'text-anchor':'middle','font-size':n.entity_type==='PERSONA'?22:20,fill:'#236166','font-family':'Arial,sans-serif','font-weight':600});}
+ const lines=wrap(n.label,data.mode==='organigrama'?25:22,2);lines.forEach((line,i)=>text(g,line,{y:r+24+i*16,'text-anchor':'middle','class':data.mode==='organigrama'?'label org':'label'}));
+ const description=data.mode==='organigrama'?[n.role,n.organization].filter(Boolean).join(' · '):n.alias||n.role||n.entity_type;
+ wrap(description,28,data.mode==='organigrama'?2:1).forEach((line,i)=>text(g,line,{y:r+28+lines.length*16+i*14,'text-anchor':'middle','class':data.mode==='organigrama'?'sub org':'sub'}));
+ const title=element('title',{},g);title.textContent=n.label+(n.role?' · '+n.role:'');
+ g.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;ev.stopPropagation();const p=point(ev);drag={node:n,start:p,x:n.x,y:n.y,screenX:ev.clientX,screenY:ev.clientY,moved:false};canvas.setPointerCapture(ev.pointerId);});
+ g.addEventListener('click',ev=>{ev.stopPropagation();if(!drag||!drag.moved)detail(n.entity_id);});
+ g.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();detail(n.entity_id);}});});
+ drawEdges();}
+function point(ev){const p=new DOMPoint(ev.clientX,ev.clientY);return p.matrixTransform(canvas.getScreenCTM().inverse());}
+canvas.addEventListener('pointerdown',ev=>{if(ev.button!==0)return;const p=point(ev);drag={start:p,x:tx,y:ty,screenX:ev.clientX,screenY:ev.clientY,moved:false};canvas.setPointerCapture(ev.pointerId);});
+canvas.addEventListener('pointermove',ev=>{if(!drag)return;const p=point(ev);if(Math.hypot(ev.clientX-drag.screenX,ev.clientY-drag.screenY)>3)drag.moved=true;
+ if(drag.node){drag.node.x=drag.x+(p.x-drag.start.x)/zoom;drag.node.y=drag.y+(p.y-drag.start.y)/zoom;nodeElements.get(drag.node.entity_id).setAttribute('transform','translate('+drag.node.x+' '+drag.node.y+')');drawEdges();}
+ else{tx=drag.x+p.x-drag.start.x;ty=drag.y+p.y-drag.start.y;transform();}});
+canvas.addEventListener('pointerup',ev=>{if(drag&&drag.node&&!drag.moved)detail(drag.node.entity_id);if(canvas.hasPointerCapture(ev.pointerId))canvas.releasePointerCapture(ev.pointerId);setTimeout(()=>{drag=null;},0);});
+canvas.addEventListener('pointercancel',()=>{drag=null;});
+function zoomAt(factor,p){const next=Math.max(.2,Math.min(8,zoom*factor));tx=p.x-(p.x-tx)*next/zoom;ty=p.y-(p.y-ty)*next/zoom;zoom=next;transform();}
+canvas.addEventListener('wheel',ev=>{ev.preventDefault();zoomAt(ev.deltaY<0?1.12:1/1.12,point(ev));},{passive:false});
+$('zoomIn').onclick=()=>zoomAt(1.25,{x:data.width/2,y:data.height/2});$('zoomOut').onclick=()=>zoomAt(.8,{x:data.width/2,y:data.height/2});
+$('fit').onclick=()=>{fit();closePanel();$('search').value='';};
+$('labels').onclick=()=>{labels=!labels;$('labels').setAttribute('aria-pressed',String(labels));edgeElements.forEach(e=>e.label.setAttribute('display',labels?'block':'none'));};
+$('search').addEventListener('input',ev=>{const query=ev.target.value.trim().toLocaleLowerCase('es');if(!query){closePanel();return;}
+ const n=data.nodes.find(n=>(n.label+' '+n.alias+' '+n.entity_id).toLocaleLowerCase('es').includes(query));if(n)detail(n.entity_id);});
+$('export').onclick=()=>{const svg=canvas.cloneNode(true);svg.setAttribute('width',data.width);svg.setAttribute('height',data.height);
+ const style=element('style',{});style.textContent=document.querySelector('style').textContent;svg.insertBefore(style,svg.firstChild);
+ const bg=element('rect',{width:'100%',height:'100%',fill:'#fbfdfe'});svg.insertBefore(bg,svg.querySelector('#viewport'));
+ const blob=new Blob([new XMLSerializer().serializeToString(svg)],{type:'image/svg+xml;charset=utf-8'});const url=URL.createObjectURL(blob);
+ const a=document.createElement('a');a.href=url;a.download='sentinel-'+data.mode+'.svg';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+$('viewTitle').textContent=(data.mode==='organigrama'?'Organigrama':'Red de vínculos')+' / '+data.case_name;
+$('count').textContent=data.nodes.length+' entidades · '+data.edges.length+' vínculos';
+if(data.messages.length){$('message').textContent=data.messages.join(' ');$('message').style.display='block';}
+build();if(data.focus&&byId.has(data.focus))detail(data.focus);
+document.addEventListener('keydown',ev=>{if(ev.key==='Escape')closePanel();});
+</script></body></html>'''
+
+
+def identity_html(entities: pd.DataFrame, relations: pd.DataFrame, *, focus: str = "", height: int = 680,
+                  state: dict | None = None, compare: str = "", mode: str = "red") -> str:
+    if entities.empty:
+        return '<div style="padding:3rem;text-align:center;color:#64748b;background:#f8fafc;border:1px solid #dbe5ed;border-radius:18px;font:14px Arial">Sin entidades en esta vista. Crea una ficha o ajusta los filtros.</div>'
+    payload = diagram_payload(state or {"entities": entities.to_dict("records"), "relationships": relations.to_dict("records")},
+                              entities, relations, focus=focus, compare=compare, mode=mode)
+    safe_json = json.dumps(payload, ensure_ascii=False, default=str).replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return DIAGRAM_HTML.replace("__GRAPH_DATA__", safe_json)
 
 
 def export_excel(state: dict) -> bytes:
     buf = BytesIO()
+    raw = export_json(state)
+    encoded = base64.b64encode(zlib.compress(raw)).decode("ascii")
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         for sheet, frame in state_frames(state).items():
+            # Readable tables plus a lossless canonical snapshot for reimport.
+            # Long fields remain in the snapshot, never silently truncated.
+            frame = frame.map(lambda value: str(value) if not isinstance(value, (int, float, bool)) else value)
+            frame = frame.map(lambda value: value if not isinstance(value, str) or len(value) < 32000 else "Contenido extenso conservado en PROYECTO_JSON")
             frame.to_excel(writer, index=False, sheet_name=sheet[:31])
         pd.DataFrame(state.get("imports", [])).to_excel(writer, index=False, sheet_name="IMPORTACIONES")
+        pd.DataFrame([{"parte": i // 30000, "sha256": file_hash(raw), "contenido": encoded[i:i + 30000]}
+                      for i in range(0, len(encoded), 30000)]).to_excel(writer, index=False, sheet_name="PROYECTO_JSON")
+        pd.DataFrame([{k: asset.get(k, "") for k in ("asset_id", "file_name", "mime_type", "sha256", "source")}
+                      for asset in state.get("assets", {}).values()],
+                     columns=["asset_id", "file_name", "mime_type", "sha256", "source"]).to_excel(writer, index=False, sheet_name="FOTOGRAFIAS")
+        # User supplied text must remain text, including identifiers beginning '='.
+        for sheet in writer.book:
+            for row in sheet:
+                for cell in row:
+                    if cell.data_type == "f":
+                        cell.data_type = "s"
     return buf.getvalue()
 
 
@@ -881,7 +1314,8 @@ def add_manual_evidence_to_state(state: dict, title: str, source: str, descripti
 def _options_with_label(state: dict, *, types: tuple[str, ...] | None = None) -> tuple[list[str], dict[str, str]]:
     items = [x for x in state.get("entities", []) if not types or x.get("entity_type") in types]
     ids = [x["entity_id"] for x in items]
-    return ids, {x["entity_id"]: f"{ENTITY_ICONS.get(x.get('entity_type'), '•')} {x.get('label', x['entity_id'])}" for x in items}
+    counts = Counter(text_value(x.get("label")) for x in items)
+    return ids, {x["entity_id"]: f"{ENTITY_ICONS.get(x.get('entity_type'), '•')} {x.get('label', x['entity_id'])}" + (f" · {x['entity_id'][-6:]}" if counts[text_value(x.get("label"))] > 1 else "") for x in items}
 
 
 def _select_column(label: str, columns: list[str], preferred: str, key: str, optional: bool = False) -> str:
@@ -894,8 +1328,16 @@ def _select_column(label: str, columns: list[str], preferred: str, key: str, opt
 def render_case_loader() -> None:
     current = get_state()
     with st.expander("Cargar expediente o sustituir el mapa", expanded=current is None):
-        mode = st.radio("Fuente de datos", ["CDR / Excel múltiple", "Proyecto de identidad", "Grafo legado"], horizontal=True, key="gm_load_mode")
-        if mode == "CDR / Excel múltiple":
+        mode = st.radio("Fuente de datos", ["CDR / Excel múltiple", "Expediente manual", "Proyecto de identidad", "Grafo legado"], horizontal=True, key="gm_load_mode")
+        if mode == "Expediente manual":
+            name = st.text_input("Nombre del expediente", value="Caso de identidades", key="gm_blank_case_name")
+            st.caption("Comienza con personas y fotografías. Puedes registrar vínculos y jerarquías con su fuente y evidencia.")
+            if current:
+                st.info("Crear otro expediente sustituye el mapa de esta sesión. Descarga el proyecto actual para conservarlo.")
+            if st.button("Crear expediente manual", type="primary", key="gm_blank_create"):
+                set_state(new_state(name.strip() or "Caso de identidades"))
+                st.rerun()
+        elif mode == "CDR / Excel múltiple":
             uploads = st.file_uploader("Selecciona uno o varios CDR (Excel/CSV)", type=["xlsx", "xls", "xlsm", "csv"], accept_multiple_files=True, key="gm_cdr_uploads")
             if not uploads:
                 st.caption("Se prioriza la hoja Datos_Limpios y se excluyen Duplicados, LOG y ESTADISTICAS.")
@@ -910,7 +1352,11 @@ def render_case_loader() -> None:
                     continue
                 mapping = infer_mapping(frame)
                 profiles.append({"frame": frame, "sheet_name": sheet, "source_hash": digest, "file_name": name, "import_id": short_id("IMP"), "captured_at": now_local()})
-                with st.expander(f"{idx + 1}. {name} · {len(frame):,} filas · hoja {sheet}", expanded=len(uploads) == 1):
+                # Streamlit no permite expanders anidados. El cargador completo
+                # ya vive dentro de un expander; cada archivo usa un contenedor
+                # delimitado para mantener el detalle multi-CDR sin romper la página.
+                with st.container(border=True):
+                    st.markdown(f"**{idx + 1}. {name}** · {len(frame):,} filas · hoja `{sheet}`")
                     st.dataframe(frame.head(4), use_container_width=True)
                     cols = [text_value(c) for c in frame.columns]
                     a, b, c = st.columns(3)
@@ -937,14 +1383,19 @@ def render_case_loader() -> None:
             if not profiles:
                 return
             a, b, c = st.columns([1.4, 1.4, 1])
-            case_name = a.text_input("Nombre del caso", value=st.session_state.get("gm_case_name", "Caso Sentinel"), key="gm_case_name")
+            case_name = a.text_input("Nombre del caso", value=st.session_state.get("gm_case_name", (current or {}).get("case_name", "Caso Sentinel")), key="gm_case_name")
             target_text = b.text_input("Hasta 4 líneas objetivo (separadas por coma)", value=st.session_state.get("gm_targets_text", ""), key="gm_targets_text")
             tolerance = c.number_input("Tolerancia deduplicación (s)", min_value=0, max_value=3600, value=int(st.session_state.get("gm_tolerance", 30)), step=5, key="gm_tolerance")
             manual_names = st.text_input("Personas a registrar sin atribuir automáticamente (opcional)", key="gm_manual_persons", help="Se crean como entidades PERSONA pendientes; no se conectan a teléfonos hasta una relación manual.")
+            keep_manual = st.checkbox("Conservar las fichas, fotos y vínculos manuales del expediente actual", value=True, key="gm_keep_manual") if current else False
+            if current:
+                st.caption("Los eventos CDR se reconstruyen con los archivos seleccionados. La casilla conserva las personas, sus atributos documentados y su historial.")
             if st.button("Construir mapa investigativo", type="primary", key="gm_build_map"):
                 targets = [x.strip() for x in target_text.split(",") if x.strip()][:4]
                 persons = [x.strip() for x in manual_names.split(",") if x.strip()]
                 state = build_state(profiles, configs, tolerance=int(tolerance), case_name=case_name or "Caso Sentinel", target_labels=targets, manual_persons=persons)
+                if current and keep_manual:
+                    state = preserve_manual_context(current, state)
                 set_state(state)
                 st.session_state["gm_graph_loaded_notice"] = f"Mapa construido: {len(state['entities'])} entidades, {len(state['events'])} eventos y {len(state['relationships'])} relaciones observadas."
                 st.rerun()
@@ -963,7 +1414,7 @@ def render_case_loader() -> None:
 def render_identity_legend() -> None:
     pills = "".join(f'<span style="display:inline-flex;align-items:center;gap:.3rem;margin:.2rem .35rem .2rem 0;padding:.25rem .55rem;border-radius:999px;background:{ENTITY_COLORS.get(kind, "#64748b")}18;color:#334155;font-size:.8rem"><span>{ENTITY_ICONS.get(kind, "•")}</span>{escape(kind)}</span>' for kind in ENTITY_TYPES)
     st.markdown(f'<div style="padding:.5rem 0 .8rem">{pills}</div>', unsafe_allow_html=True)
-    st.caption("Línea sólida = dato importado/observado · línea discontinua = relación manual, inferida o descartada. La comunicación no equivale a parentesco ni titularidad.")
+    st.caption("Azul: dato importado / CDR · rojo: relación manual · ámbar: inferencia. Punteado: pendiente o probable. Se excluyen los vínculos descartados. Una comunicación no acredita parentesco ni titularidad.")
 
 
 def render_case_exports(state: dict) -> None:
@@ -971,50 +1422,166 @@ def render_case_exports(state: dict) -> None:
     st.download_button("Descargar expediente JSON", export_json(state), file_name=f"{state.get('case_id','caso')}_identidad.json", mime="application/json", key="gm_export_json")
 
 
+def map_view_data(state: dict, focus: str, compare: str, depth: int, minimum: int,
+                  sources: list[str], types: list[str], mode: str, limit: int) -> tuple[pd.DataFrame, pd.DataFrame, int]:
+    filtered = {**state}
+    filtered["entities"] = [row for row in state.get("entities", []) if row.get("entity_type") in (["PERSONA"] if mode == "organigrama" else types)]
+    allowed = {row["entity_id"] for row in filtered["entities"]}
+    filtered["relationships"] = [rel for rel in state.get("relationships", [])
+        if rel.get("source_id") in allowed and rel.get("target_id") in allowed
+        and (mode != "organigrama" or rel.get("relation_type") in HIERARCHY_RELATIONS)]
+    entities, relations = relationship_graph(filtered, focus, depth, minimum, sources)
+    if compare and compare != focus:
+        extra_nodes, extra_edges = relationship_graph(filtered, compare, depth, minimum, sources)
+        entities = pd.concat([entities, extra_nodes]).drop_duplicates("entity_id")
+        relations = pd.concat([relations, extra_edges]).drop_duplicates("relation_id")
+    total = len(entities)
+    if total > limit:
+        degree = Counter(relations["source_id"].tolist() + relations["target_id"].tolist())
+        selected = sorted(entities["entity_id"], key=lambda key: (key not in {focus, compare}, -degree[key], key))[:limit]
+        entities = entities[entities["entity_id"].isin(selected)]
+        relations = relations[relations["source_id"].isin(selected) & relations["target_id"].isin(selected)]
+    return entities, relations, total
+
+
+def render_person_editor(state: dict) -> None:
+    people, labels = _options_with_label(state, types=("PERSONA",))
+    with st.expander("Fichas de personas · crear, completar o actualizar", expanded=not people):
+        st.caption("Registra la identidad, añade una fotografía y documenta sus atributos. Las personas con el mismo nombre permanecen separadas por su ID.")
+        pending = st.session_state.pop("gm_person_pending_id", None)
+        if pending in people:
+            st.session_state["gm_person_select"] = pending
+        if st.session_state.get("gm_person_select") not in [""] + people:
+            st.session_state.pop("gm_person_select", None)
+        selected = st.selectbox("Ficha a editar", [""] + people,
+            format_func=lambda key: "＋ Registrar nueva persona" if not key else labels[key] + " · " + key[-6:],
+            key="gm_person_select")
+        current = entity_lookup(state).get(selected, {})
+        metadata = entity_metadata(current)
+        prefix = "gm_person_" + (selected or "new") + "_" + str(len(state.get("entity_history", [])))
+        photo = portrait_uri(state, current)
+        if photo:
+            st.image(BytesIO(base64.b64decode(photo.split(",", 1)[1])), width=110, caption="Fotografía de la ficha actual")
+        with st.form(prefix + "_form"):
+            a, b = st.columns(2)
+            label = a.text_input("Nombre completo", value=text_value(current.get("label")), key=prefix + "_name")
+            confidence = b.selectbox("Confianza de la identidad", CONFIDENCE_LEVELS,
+                index=CONFIDENCE_LEVELS.index(current.get("confidence")) if current.get("confidence") in CONFIDENCE_LEVELS else 3, key=prefix + "_confidence")
+            fields = {}
+            for index, (key, title) in enumerate(PROFILE_FIELDS):
+                col = a if index % 2 == 0 else b
+                fields[key] = col.text_input(title, value=text_value(metadata.get(key)), key=prefix + "_" + key)
+            source = st.text_input("Fuente de la ficha", value=text_value(current.get("source_detail")), key=prefix + "_source",
+                help="Documento, entrevista, informe u otra referencia que respalda los datos capturados.")
+            notes = st.text_area("Observaciones de la persona", value=text_value(current.get("notes")), key=prefix + "_notes")
+            evidence_lookup = {row["evidence_id"]: row.get("title", row["evidence_id"]) for row in state.get("evidences", [])}
+            previous_ids = list(filter(None, text_value(current.get("evidence_ids")).split(",")))
+            evidence_options = list(dict.fromkeys(list(evidence_lookup) + previous_ids))
+            evidence_ids = st.multiselect("Evidencias de la ficha", evidence_options, default=previous_ids,
+                format_func=lambda key: evidence_lookup.get(key, key) + " · " + key, key=prefix + "_evidence")
+            image_file = st.file_uploader("Fotografía (JPG, PNG o WebP · hasta 5 MB)", type=["jpg", "jpeg", "png", "webp"], key=prefix + "_photo")
+            photo_source = st.text_input("Fuente de la fotografía", key=prefix + "_photo_source")
+            remove_photo = st.checkbox("Retirar la fotografía de esta ficha", value=False, key=prefix + "_remove_photo") if photo else False
+            saved = st.form_submit_button("Guardar ficha", type="primary")
+        if saved:
+            try:
+                portrait = prepare_portrait(image_file) if image_file is not None else None
+                updated = copy.deepcopy(state)
+                person_id = save_person_profile(updated, selected, label, fields, confidence=confidence, source=source,
+                    notes=notes, evidence_ids=evidence_ids, portrait=portrait, photo_source=photo_source, remove_photo=remove_photo)
+                set_state(updated)
+                st.session_state["gm_person_pending_id"] = person_id
+                st.session_state["gm_graph_loaded_notice"] = "Ficha guardada con su historial de cambios."
+                st.rerun()
+            except (ValueError, OSError) as error:
+                st.error(str(error))
+        if selected:
+            st.markdown("**Vincular un teléfono, dispositivo u otro atributo**")
+            st.caption("Cada atributo crea una entidad y un vínculo documentado. No se atribuye automáticamente el uso de una línea.")
+            with st.form("gm_person_attribute_" + selected):
+                a, b = st.columns(2)
+                kind = a.selectbox("Tipo de atributo", [x for x in ENTITY_TYPES if x not in {"PERSONA", "CASO", "EVENTO"}], key="gm_attribute_type_" + selected)
+                value = b.text_input("Valor / etiqueta del atributo", key="gm_attribute_value_" + selected)
+                relation = a.selectbox("Vínculo con la persona", ["UTILIZA", "ASOCIADO_A", "PROPIETARIO_DE", "TIENE_PERFIL", "RESIDE_EN", "TRABAJA_EN", "RELACION_DOCUMENTAL"], key="gm_attribute_relation_" + selected)
+                attribute_confidence = b.selectbox("Confianza del vínculo", CONFIDENCE_LEVELS, index=3, key="gm_attribute_confidence_" + selected)
+                attribute_source = st.text_input("Fuente del atributo y vínculo", key="gm_attribute_source_" + selected)
+                attribute_evidence = st.multiselect("Evidencias del atributo", list(evidence_lookup), format_func=lambda key: evidence_lookup[key] + " · " + key, key="gm_attribute_evidence_" + selected)
+                if st.form_submit_button("Vincular atributo"):
+                    if not value.strip() or not attribute_source.strip():
+                        st.error("Escribe el valor del atributo y su fuente.")
+                    else:
+                        updated = copy.deepcopy(state)
+                        attribute_id = add_entity(updated, kind, value, source_type="MANUAL", source_detail=attribute_source,
+                            confidence=attribute_confidence, evidence_ids=attribute_evidence)
+                        add_manual_relation_to_state(updated, selected, attribute_id, relation, source=attribute_source,
+                            confidence=attribute_confidence, evidence_ids=attribute_evidence)
+                        set_state(updated)
+                        st.session_state["gm_graph_loaded_notice"] = "Atributo vinculado con fuente y confianza."
+                        st.rerun()
+            if metadata.get("photo_asset") in state.get("assets", {}):
+                original = state["assets"][metadata["photo_asset"]]
+                st.download_button("Descargar fotografía original", data=base64.b64decode(original["data"]),
+                    file_name=original.get("file_name", "fotografia"), mime=original.get("mime_type", "image/jpeg"), key="gm_photo_original_" + selected)
+            history = [row for row in state.get("entity_history", []) if row.get("entity_id") == selected]
+            if history:
+                st.caption(f"Revisiones guardadas: {len(history)}. El historial íntegro se conserva en las exportaciones de proyecto.")
+
+
 def render_identity_tab(state: dict) -> None:
-    render_section("Mapa de identidad", "Explora entidades, relaciones y la trazabilidad que sostiene cada conexión.", "01")
+    render_section("Mapa de identidad", "Fotografías, vínculos y fichas documentadas. Selecciona un nodo para consultar su detalle.", "01")
+    mode_label = st.radio("Distribución del diagrama", ["Red de vínculos", "Organigrama"], horizontal=True, key="gm_graph_layout")
+    mode = "organigrama" if mode_label == "Organigrama" else "red"
     source_options = sorted(set(SOURCE_TYPES) | set(x.get("source_type", "") for x in state.get("relationships", [])))
     if st.button("Limpiar filtros del mapa", key="gm_clear_identity_filters"):
-        for key in ("gm_graph_focus", "gm_graph_depth", "gm_graph_minimum", "gm_graph_sources"):
+        for key in ("gm_graph_focus", "gm_graph_compare", "gm_graph_depth", "gm_graph_minimum", "gm_graph_sources", "gm_graph_scope", "gm_graph_types", "gm_graph_limit"):
             st.session_state.pop(key, None)
         st.rerun()
-    a, b, c, d = st.columns([2.5, 1, 1, 1.6])
-    ids, labels = _options_with_label(state)
-    with a:
-        focus = st.selectbox("Entidad focal", [""] + ids, format_func=lambda x: "Todas las entidades" if not x else labels.get(x, x), key="gm_graph_focus")
-    depth = b.selectbox("Saltos", [1, 2, 3, 4], index=0, key="gm_graph_depth")
-    minimum = c.number_input("Mín. soporte", min_value=0, value=0, step=1, key="gm_graph_minimum")
-    source_filter = d.multiselect("Origen", source_options, default=[x for x in source_options if x in {"IMPORTADO", "MANUAL"}], key="gm_graph_sources")
-    visible_entities, visible_relations = relationship_graph(state, focus, int(depth), int(minimum), source_filter or None)
-    if len(visible_entities) > 500:
-        st.warning("El mapa visual está limitado a 500 entidades para conservar legibilidad y rendimiento. El expediente completo permanece disponible en las exportaciones.")
-        keep_ids = set(visible_entities.head(500)["entity_id"])
-        visible_entities = visible_entities[visible_entities["entity_id"].isin(keep_ids)]
-        visible_relations = visible_relations[visible_relations["source_id"].isin(keep_ids) & visible_relations["target_id"].isin(keep_ids)]
-    components.html(identity_html(visible_entities, visible_relations, focus=focus), height=700, scrolling=False)
+    a, b, c, d = st.columns([2, 2, 1, 1])
+    ids, labels = _options_with_label(state, types=("PERSONA",) if mode == "organigrama" else None)
+    for key in ("gm_graph_focus", "gm_graph_compare"):
+        if st.session_state.get(key) not in [""] + ids:
+            st.session_state.pop(key, None)
+    focus = a.selectbox("Entidad focal", [""] + ids, format_func=lambda key: "Vista general" if not key else labels[key], key="gm_graph_focus")
+    compare_ids = [key for key in ids if key != focus]
+    if st.session_state.get("gm_graph_compare") not in [""] + compare_ids:
+        st.session_state.pop("gm_graph_compare", None)
+    compare = b.selectbox("Comparar con", [""] + compare_ids,
+        format_func=lambda key: "Sin segundo centro" if not key else labels[key], disabled=mode == "organigrama", key="gm_graph_compare")
+    depth = c.selectbox("Saltos", [1, 2, 3, 4], index=1, key="gm_graph_depth")
+    minimum = d.number_input("Mín. eventos CDR", min_value=0, value=0, step=1, key="gm_graph_minimum")
+    e, f, g = st.columns([1.6, 2.4, 1.3])
+    sources = e.multiselect("Origen de vínculos", source_options,
+        default=[x for x in source_options if x in {"IMPORTADO", "MANUAL"}], key="gm_graph_sources")
+    if mode == "organigrama":
+        f.selectbox("Mostrar", ["Personas"], disabled=True, key="gm_org_scope")
+        types = ["PERSONA"]
+    else:
+        scope = f.selectbox("Mostrar", ["Todas las entidades", "Personas y teléfonos", "Personas", "Elegir tipos"], key="gm_graph_scope")
+        types = ["PERSONA"] if scope == "Personas" else ["PERSONA", "TELEFONO"] if scope == "Personas y teléfonos" else list(ENTITY_TYPES)
+        if scope == "Elegir tipos":
+            types = st.multiselect("Tipos de entidad", list(ENTITY_TYPES), default=list(ENTITY_TYPES), key="gm_graph_types")
+    limit = g.select_slider("Máximo de nodos", options=[20, 40, 60, 80, 120, 160, 200, 300], value=80, key="gm_graph_limit")
+    if mode == "organigrama":
+        compare = ""
+        st.caption("Niveles definidos por DIRIGE_A, SUPERVISA_A, COORDINA_A, REPORTA_A o SUBORDINADO_DE. Registra estas relaciones en Edición manual; el cargo escrito no genera flechas.")
+    else:
+        st.caption("Elige dos centros para separar sus vecinos y colocar los contactos directos comunes entre ambos. Amplía los saltos para explorar sus atributos y comunicaciones.")
+    visible_entities, visible_relations, total = map_view_data(state, focus, compare, int(depth), int(minimum), sources, types, mode, int(limit))
+    if total > limit:
+        st.info(f"Se muestran {len(visible_entities)} de {total} entidades que coinciden con los filtros. Se priorizan los centros seleccionados y las entidades más conectadas. El expediente conserva todos los registros.")
+    html = identity_html(visible_entities, visible_relations, focus=focus, compare=compare, mode=mode, state=state)
+    components.html(html, height=780, scrolling=False)
+    st.download_button("Descargar diagrama interactivo (HTML)", html.encode("utf-8"), f"sentinel_{mode}.html", "text/html", key="gm_diagram_download", disabled=visible_entities.empty)
+    st.caption("Clic en una persona: consultar su ficha. Para editarla, abre «Fichas de personas» y selecciona su nombre. El HTML permite consultar la vista sin conexión; JSON y Excel conservan el expediente editable y las fotos originales.")
     render_kpi_row([
         {"label": "Entidades visibles", "value": len(visible_entities), "tone": "primary"},
         {"label": "Relaciones visibles", "value": len(visible_relations)},
-        {"label": "Eventos deduplicados", "value": len(state.get("events", []))},
-        {"label": "Ubicaciones", "value": sum(1 for x in state.get("entities", []) if x.get("entity_type") in {"UBICACION", "ANTENA", "DOMICILIO", "EMPRESA"})},
-        {"label": "NO_CLASIFICADO", "value": sum(1 for x in state.get("events", []) if x.get("event_type") == "NO_CLASIFICADO")},
+        {"label": "Personas en el caso", "value": sum(row.get("entity_type") == "PERSONA" for row in state.get("entities", []))},
         {"label": "Evidencias", "value": len(state.get("evidences", []))},
-    ], columns=6)
-    render_identity_legend()
-    if focus:
-        detail = entity_lookup(state).get(focus, {})
-        st.markdown(f"#### {ENTITY_ICONS.get(detail.get('entity_type'), '•')} {detail.get('label', focus)}")
-        st.caption(f"Tipo: {detail.get('entity_type', '')} · Origen: {detail.get('source_type', '')} · Confianza: {detail.get('confidence', '')}")
-        try:
-            metadata = json.loads(detail.get("metadata", "{}"))
-        except (TypeError, json.JSONDecodeError):
-            metadata = {}
-        if metadata:
-            st.caption(" · ".join(f"{key}: {value}" for key, value in metadata.items()))
-        if detail.get("notes"):
-            st.info(f"Observaciones: {detail['notes']}")
-        related = [r for r in state.get("relationships", []) if r.get("source_id") == focus or r.get("target_id") == focus]
-        st.dataframe(pd.DataFrame([{**r, "origen": entity_label(state, r.get("source_id", "")), "destino": entity_label(state, r.get("target_id", ""))} for r in related]), use_container_width=True)
+    ], columns=4)
+    render_person_editor(state)
+    with st.expander("Leyenda de entidades y procedencia"):
+        render_identity_legend()
 
 
 def render_communications_tab(state: dict) -> None:
@@ -1203,8 +1770,10 @@ def render_analysis_tab(state: dict) -> None:
     with st.expander("Entidades con más vínculos y soporte documental", expanded=False):
         link_rows = [{"entidad": lookup.get(entity_id_value, {}).get("label", entity_id_value), "tipo": lookup.get(entity_id_value, {}).get("entity_type", ""), "vinculos": count} for entity_id_value, count in link_counts.most_common(25)]
         support_rows = [{"entidad": lookup.get(entity_id_value, {}).get("label", entity_id_value), "tipo": lookup.get(entity_id_value, {}).get("entity_type", ""), "evidencias": len(list(filter(None, text_value(lookup.get(entity_id_value, {}).get("evidence_ids")).split(","))))} for entity_id_value in link_counts]
-        st.dataframe(pd.DataFrame(link_rows), use_container_width=True)
-        st.dataframe(pd.DataFrame(support_rows).sort_values("evidencias", ascending=False), use_container_width=True)
+        if not link_rows:
+            st.info("Aún no hay vínculos para este ranking. Las filas importadas se conservan en Evidencias y Comunicaciones.")
+        st.dataframe(pd.DataFrame(link_rows, columns=["entidad", "tipo", "vinculos"]), use_container_width=True)
+        st.dataframe(pd.DataFrame(support_rows, columns=["entidad", "tipo", "evidencias"]).sort_values("evidencias", ascending=False), use_container_width=True)
     if not selected:
         st.caption("Selecciona objetivos para activar comparación de contactos, objetivo↔objetivo y coberturas.")
 
@@ -1254,7 +1823,8 @@ def render_manual_tab(state: dict) -> None:
                     st.success("Evidencia manual agregada.")
                     st.rerun()
     with right:
-        st.markdown("#### Nueva relación personal / documental")
+        st.markdown("#### Nueva relación personal, jerárquica o documental")
+        st.caption("Organigrama: DIRIGE_A / SUPERVISA_A / COORDINA_A apuntan al dependiente. REPORTA_A / SUBORDINADO_DE apuntan al superior. La fuente y la confianza quedan en cada vínculo.")
         ids, labels = _options_with_label(state)
         with st.form("gm_manual_relation_form", clear_on_submit=True):
             source_id = st.selectbox("Origen", ids, format_func=lambda x: labels.get(x, x), key="gm_manual_relation_source") if ids else ""
@@ -1271,8 +1841,10 @@ def render_manual_tab(state: dict) -> None:
             if st.form_submit_button("Agregar relación"):
                 if not source_id or not target_id or source_id == target_id:
                     st.error("Elige origen y destino distintos.")
-                elif relation_type_value in PERSONAL_RELATIONS and (entity_lookup(state).get(source_id, {}).get("entity_type") != "PERSONA" or entity_lookup(state).get(target_id, {}).get("entity_type") != "PERSONA"):
-                    st.error("Las relaciones familiares/personales deben conectar dos entidades PERSONA. Registra primero ambas personas.")
+                elif relation_type_value in (*PERSONAL_RELATIONS, *HIERARCHY_RELATIONS) and (entity_lookup(state).get(source_id, {}).get("entity_type") != "PERSONA" or entity_lookup(state).get(target_id, {}).get("entity_type") != "PERSONA"):
+                    st.error("Las relaciones personales y jerárquicas deben conectar dos entidades PERSONA. Registra primero ambas personas.")
+                elif start_date and end_date and start_date > end_date:
+                    st.error("La fecha final no puede ser anterior a la inicial.")
                 else:
                     add_manual_relation_to_state(state, source_id, target_id, relation_type_value, start_date=start_date.isoformat() if isinstance(start_date, date) else "", end_date=end_date.isoformat() if isinstance(end_date, date) else "", source=relation_source, description=description, confidence=confidence, notes=notes, evidence_ids=evidence_ids)
                     set_state(state)
@@ -1283,8 +1855,9 @@ def render_manual_tab(state: dict) -> None:
 
 
 def render_exports_and_notice(state: dict) -> None:
+    notice_slot = st.empty()
     if notice := st.session_state.pop("gm_graph_loaded_notice", None):
-        st.success(notice)
+        notice_slot.success(notice)
     with st.container(border=True):
         a, b, c, d, e = st.columns([2.2, 1, 1, 1, 1])
         a.markdown(f"**Caso:** {escape(text_value(state.get('case_name'), 'Caso Sentinel'))}  ·  `{escape(text_value(state.get('case_id')))}`")
@@ -1299,16 +1872,19 @@ def render_exports_and_notice(state: dict) -> None:
 def main() -> None:
     login_guard("Grafo Inteligente")
     render_suite_sidebar()
+    # Hide only Streamlit's automatically generated page list on this page.
+    # Keep the suite's custom sidebar, including its icons and controls.
+    st.markdown('<style>[data-testid="stSidebarNav"], [data-testid="stSidebarNavSeparator"] {display:none !important;}</style>', unsafe_allow_html=True)
     render_page_header(
         "Sentinel · Mapa investigativo",
-        "Mapa de identidad para analizar comunicaciones, relaciones personales y evidencia sin atribuir parentesco automáticamente.",
+        "Red de vínculos y organigrama con fotografías, fichas de personas y relaciones documentadas.",
         status=f"Operativo · {APP_VERSION}",
-        tags=["Identidad", "Proveniencia", "CDR múltiple", "Sin servicios externos"],
+        tags=["Fotografías", "Organigrama", "Fichas de identidad", "CDR múltiple"],
     )
     render_case_loader()
     state = get_state()
     if state is None:
-        render_info_panel("Comienza con un expediente", "Carga uno o varios Excel/CSV CDR. Se usará Datos_Limpios, se excluirán Duplicados y cada fila quedará vinculada a archivo, hoja, fila, hash y hora de captura.", "info")
+        render_info_panel("Comienza con un expediente", "Carga Excel/CSV CDR o elige Expediente manual para empezar con personas y fotografías. Después completa las fichas y registra los vínculos que forman la red o el organigrama.", "info")
         return
     render_exports_and_notice(state)
     tabs = st.tabs(["Mapa de identidad", "Comunicaciones", "Relaciones personales", "Relaciones y soporte", "Cronología", "Mapa geográfico", "Evidencias", "Análisis", "Edición manual"])
