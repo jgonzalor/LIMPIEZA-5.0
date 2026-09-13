@@ -42,13 +42,14 @@ def inject_global_styles() -> None:
   --gm-shadow: 0 10px 26px rgba(15, 23, 42, .075);
 }
 
-# Hide Streamlit's automatic multipage list; Go Mapper renders the only navigation menu.
-# Selectors cover Streamlit Cloud and local Streamlit DOM variants.
+/* Hide Streamlit's automatic multipage list; Go Mapper renders the only navigation menu. */
+/* Selectors cover Streamlit Cloud and local Streamlit DOM variants. */
 [data-testid="stSidebarNav"],
 [data-testid="stSidebarNavItems"],
 [data-testid="stSidebarNavSeparator"],
+div[data-testid="stSidebarNav"],
 section[data-testid="stSidebar"] nav[aria-label="Main menu"] {display:none!important;}
-# Keep the sidebar itself and the custom Go Mapper navigation visible.
+/* Keep the sidebar itself and the custom Go Mapper navigation visible. */
 [data-testid="stSidebar"] [data-testid="stSidebarContent"] {padding-top:.65rem!important;}
 #MainMenu, footer {visibility: hidden;}
 [data-testid="stHeader"] {background:transparent;}
