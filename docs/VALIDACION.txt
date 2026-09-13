@@ -1,0 +1,6 @@
+Go Mapper Suite 4.1.1
+Python 3.12 / Streamlit 1.35.0
+19 pruebas aprobadas (pytest), 9 avisos de deprecacion de dependencias.
+14 paginas operativas recorridas desde app.py.
+Chromium: login, portada, grafo JSON circular con canvas, limpieza offline con descarga Excel, cronologia con PDF, Leaflet con marcadores.
+Pruebas con datos sinteticos. Sin geocodificacion real ni validacion de teselas remotas.

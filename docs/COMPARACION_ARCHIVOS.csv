@@ -1,0 +1,57 @@
+﻿Archivo,Original vs Lab,Entrega 4.1.0
+.devcontainer/devcontainer.json,Solo original,Conservado
+.env,Igual,Conservado
+.gitignore,Igual,Modificado
+.streamlit/config.toml,Diferente,Modificado
+ANTENA OFICIAL fondo trasparente.png,Igual,Conservado
+app.py,Diferente,Modificado
+assets/BRUJULA AZIMUTH SIN RELLENO.png,Igual,Conservado
+assets/antena_oficial.png,Igual,Conservado
+core/__init__.py,Igual,Conservado
+core/agent_intents.py,Igual,Conservado
+core/agent_intents_registry.py,Igual,Conservado
+core/agent_orchestrator.py,Igual,Conservado
+core/agent_validators.py,Igual,Conservado
+core/crearcarpeta core,Igual,Conservado
+core/kmz_pro_analysis.py,Igual,Conservado
+core/kmz_pro_builder.py,Igual,Conservado
+core/kmz_pro_popups.py,Igual,Conservado
+core/kmz_pro_routing.py,Igual,Conservado
+core/kmz_pro_styles.py,Igual,Conservado
+core/kmz_pro_utils.py,Igual,Conservado
+core/nlp_parse.py,Igual,Conservado
+core/query_engine.py,Igual,Conservado
+core/utils_text.py,Igual,Conservado
+guardian.py,Igual,Modificado
+modules/auth.py,Igual,Modificado
+modules/kmz_builder.py,Igual,Modificado
+pages/.gitkeep,Solo original,No incluido
+pages/__init__.py,Igual,Conservado
+pages/app armonizador a telcel.py,Igual,Modificado
+pages/app_consulta_visual.py,Diferente,Modificado
+pages/app_grafo_inteligente.py,Diferente,Modificado
+pages/app_informe_cdr.py,Diferente,Modificado
+pages/app_limpieza_excel.py,Diferente,Modificado
+pages/app_linea_tiempo.py,Igual,Modificado
+pages/app_link_analysis.py,Diferente,Modificado
+pages/app_maestro_ubicaciones.py,Igual,Modificado
+pages/app_mapper_azimuth.py,Diferente,Modificado
+pages/app_mapper_presencia_aprox.py,Solo original,Modificado
+pages/app_multi_cdr_links.py,Igual,Modificado
+pages/app_oraculo_cdr.py,Diferente,Modificado
+pages/app_sentinel_mapper_kmz_pro.py,Diferente,Modificado
+pages/kmz_pro_analysis.py,Igual,Conservado
+pages/kmz_pro_builder.py,Igual,Conservado
+pages/kmz_pro_popups.py,Igual,Conservado
+pages/kmz_pro_styles.py,Igual,Conservado
+pages/kmz_pro_utils.py,Igual,Conservado
+plus_repo.sqlite,Igual,Conservado
+requirements.txt,Igual,Modificado
+runtime.txt,Igual,Conservado
+scripts/crearcarpeta,Igual,Conservado
+scripts/smoke_test_oraculo.py,Igual,Conservado
+suite_nav.py,Diferente,Modificado
+ui/__init__.py,Solo Lab,Conservado
+ui/components.py,Solo Lab,Modificado
+ui/styles.py,Solo Lab,Modificado
+ui/theme.py,Solo Lab,Conservado

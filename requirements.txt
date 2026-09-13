@@ -1,0 +1,22 @@
+# requirements.txt — Go Mapper (Limpieza) estable
+streamlit==1.35.0        # Framework web para la app (UI en el navegador)
+pandas==2.2.2            # DataFrames y análisis/limpieza de datos
+numpy==1.26.4            # Cálculo numérico base (lo usa pandas)
+openpyxl==3.1.5          # Lectura/Escritura de archivos Excel .xlsx
+simplekml==1.3.6         # Generación de KML/KMZ (módulo de mapas/KMZ)
+geopy==2.4.1             # Geocoding (Nominatim) y utilidades geográficas
+python-dotenv==1.0.1     # Cargar variables de entorno desde .env
+openlocationcode==1.0.1  # Códigos Plus (Open Location Code / Plus Codes)
+requests==2.31.0         # Peticiones HTTP (consultas a APIs, etc.)
+# XlsxWriter==3.2.0      # (Opcional) Exportación Excel más rápida (engine)
+# pydeck==0.9.1          # (Opcional) Capas de mapas 3D/visualización geográfica
+fpdf2==2.7.9       #(este es para generar PDF)
+pyvis==0.3.2 #redes/grafos interactivos en HTML
+networkx  #grafo estático para exportar como PNG
+matplotlib #grafo estático para exportar como PNG
+pyshp==2.3.1 #solo para app de ICC
+pyproj==3.6.1 #SOLO PARA APP DE ICC
+duckdb # --- ORÁCULO CDR ---
+python-docx
+
+xlrd==2.0.1

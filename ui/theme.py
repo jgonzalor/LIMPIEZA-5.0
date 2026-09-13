@@ -1,0 +1,15 @@
+"""Design tokens for the Go Mapper operational UI."""
+from __future__ import annotations
+
+PRIMARY = "#0F766E"
+PRIMARY_SOFT = "#CCFBF1"
+SECONDARY = "#2563EB"
+BACKGROUND = "#F5F8FB"
+SIDEBAR = "#0B1220"
+SIDEBAR_SOFT = "#111827"
+TEXT = "#0F172A"
+MUTED = "#64748B"
+BORDER = "#D8E2EF"
+WARNING = "#B45309"
+DANGER = "#B91C1C"
+SUCCESS = "#047857"
